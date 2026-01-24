@@ -1,0 +1,70 @@
+providers:
+  openai:
+    models:
+      gpt-5-nano:
+        supports_temperature: false
+        supports_top_p: false
+        supports_tools: true
+        supports_response_format: true
+        supports_thinking_effort: true
+        supports_thinking_budget: false
+        max_tokens_param: max_completion_tokens
+        api_mode: responses
+        costs:
+          input_per_1m_usd: 0.05
+          output_per_1m_usd: 0.40
+
+  grok:
+    models:
+      grok-4-1-fast-reasoning:
+        supports_temperature: true
+        supports_top_p: true
+        supports_tools: true
+        supports_response_format: true
+        supports_thinking_effort: false
+        supports_thinking_budget: false
+        max_tokens_param: max_tokens
+        api_mode: responses
+        costs:
+          input_per_1m_usd: 0.2
+          output_per_1m_usd: 0.5
+
+  lm_studio:
+    models:
+      openai/gpt-oss-20b:
+        supports_temperature: true
+        supports_top_p: true
+        supports_top_k: true
+        supports_tools: true
+        supports_response_format: true
+        supports_thinking_effort: true
+        supports_thinking_budget: false
+        max_tokens_param: max_tokens
+        costs:
+          input_per_1m_usd: 0.0
+          output_per_1m_usd: 0.0
+      zai-org/glm-4.7-flash:
+        supports_temperature: true
+        supports_top_p: true
+        supports_top_k: true
+        supports_tools: true
+        supports_response_format: true
+        supports_thinking_effort: false
+        supports_thinking_budget: false
+        enable_thinking: true
+        tool_schema: responses
+        tools_api_mode: chat_completions
+        max_tokens_param: max_tokens
+        costs:
+          input_per_1m_usd: 0.0
+          output_per_1m_usd: 0.0
+
+  gemini:
+    models:
+      gemini-2.5-flash-lite:
+        supports_thinking_budget: true
+        supports_thinking_effort: false
+        costs:
+          input_per_1m_usd: 0.1
+          output_per_1m_usd: 0.4
+      

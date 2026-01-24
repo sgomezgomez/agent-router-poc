@@ -1,0 +1,50 @@
+[project]
+name = "agent-router"
+version = "0.1.0"
+description = "Autonomous agent with MCP and A2A routing"
+authors = [
+    {name = "Sebastian Gomez",email = "sgomezgomez@gmail.com"}
+]
+readme = "README.md"
+requires-python = "^3.10"
+dependencies = [
+    "openai (>=2.15.0,<3.0.0)",
+    "google-genai (>=1.57.0,<2.0.0)",
+    "httpx (>=0.28.1,<0.29.0)",
+    "motor (>=3.7.1,<4.0.0)",
+    "pymongo (>=4.16.0,<5.0.0)",
+    "pydantic (>=2.12.5,<3.0.0)",
+    "pydantic-settings (>=2.12.0,<3.0.0)",
+    "python-dotenv (>=1.2.1,<2.0.0)",
+    "pyyaml (>=6.0.3,<7.0.0)",
+    "aiofiles (<25.0)",
+    "tenacity (>=9.1.2,<10.0.0)",
+    "gradio (>=6.3.0,<7.0.0)",
+    "mcp (>=1.25.0,<2.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry.group.dev.dependencies]
+black = "^25.12.0"
+ruff = "^0.14.11"
+mypy = "^1.19.1"
+pre-commit = "^4.5.1"
+
+[tool.black]
+line-length = 100
+target-version = ['py310']
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
