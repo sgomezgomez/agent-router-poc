@@ -1,0 +1,399 @@
+---
+description: Architecture enforcement rules - ensure code follows design principles
+globs: src/**/*.py
+alwaysApply: true
+---
+
+# Architecture Enforcement Rules
+
+## Core Principle: ONE Smart Component
+
+**Agent Layer is THE ONLY smart component. Everything else is dumb infrastructure.**
+
+### ✅ CORRECT Architecture
+
+```
+Main Script (dumb) → Agent Layer (SMART) → Infrastructure (dumb)
+                            ↓
+                ┌───────────┼───────────┐
+                ↓           ↓           ↓
+            LLM Service  Storage  Orchestrator
+                                      ↓
+                                MCP/A2A Tools
+```
+
+### Decision-Making Rules
+
+| Component | Can Make Decisions? | Responsibility |
+|-----------|-------------------|----------------|
+| **Main Script** | ❌ NO | Only I/O: receives input, yields output |
+| **Agent Layer** | ✅ YES | Functional decisions: routing and next steps |
+| **LLM Service** | ⚠️ LIMITED | LLM calls + technical resilience only |
+| **Orchestrator** | ❌ NO | Just executes tools as instructed |
+| **Storage** | ❌ NO | Just saves/loads data |
+| **Connectors** | ❌ NO | Just communicates with protocols |
+
+---
+
+## Storage Separation
+
+**LLM calls and tool executions MUST be stored separately.**
+
+### ✅ CORRECT
+
+```python
+# In Agent Layer
+async def process_query(self, query: str):
+    # Agent makes decision
+    llm_response = await self.llm_service.generate(prompt)
+
+    # Agent stores its own LLM call immediately
+    await self.llm_call_repo.create({
+        "provider": "openai",
+        "prompt": prompt,
+        "response": llm_response
+    })
+
+    # Agent calls Orchestrator to execute
+    tool_results = await self.orchestrator.execute(tools)
+
+# In Orchestrator
+async def execute(self, tools: List[Tool]):
+    # Orchestrator executes and stores tool execution
+    result = await self.mcp_client.call_tool(tool)
+
+    await self.tool_execution_repo.create({
+        "tool_name": tool.name,
+        "parameters": tool.params,
+        "result": result
+    })
+```
+
+### ❌ WRONG
+
+```python
+# DON'T let Orchestrator decide anything
+async def execute(self, tools: List[Tool]):
+    if self.should_retry(tool):  # NO! Orchestrator doesn't decide
+        await self.retry(tool)
+```
+
+```python
+# DON'T mix LLM calls with tool executions
+await self.storage.create({
+    "type": "llm_call",  # BAD - mixed in same collection
+    "prompt": prompt
+})
+```
+
+**Rule**:
+- Agent Layer stores LLM calls to `llm_calls` collection
+- Orchestrator stores tool executions to `tool_executions` collection
+- NO other component touches these collections
+
+---
+
+## Interface-Driven Design
+
+**All connectors (LLM providers, MCP, A2A) MUST implement abstract interfaces.**
+
+### ✅ CORRECT
+
+```python
+# Define interface in core/interfaces.py
+class LLMProvider(ABC):
+    @abstractmethod
+    async def generate(self, request: LLMRequest) -> LLMResponse: ...
+
+# Implement in llm/providers/openai.py
+class OpenAIProvider(LLMProvider):
+    async def generate(self, request: LLMRequest) -> LLMResponse:
+        # Implementation
+        pass
+```
+
+### ❌ WRONG
+
+```python
+# DON'T create providers without interface
+class OpenAIProvider:  # Missing ABC inheritance
+    async def generate(self, prompt: str) -> str:
+        pass
+```
+
+**Rule**: Every connector/provider MUST inherit from an ABC in `core/interfaces.py`.
+
+---
+
+## Streaming Support
+
+**Both Agent and LLM Service MUST support streaming and non-streaming modes.**
+
+### ✅ CORRECT
+
+```python
+class Agent:
+    async def process_query(self, query: str, streaming: bool = False):
+        if streaming:
+            async for event in self._process_stream(query):
+                yield event
+        else:
+            result = await self._process_non_stream(query)
+            return result
+```
+
+### ❌ WRONG
+
+```python
+class Agent:
+    async def process_query(self, query: str):
+        # Only supports one mode - BAD!
+        return await self.llm_service.generate(query)
+```
+
+**Rule**: All components in the execution path must support both modes.
+
+---
+
+## Event-Driven Streaming
+
+**Streaming mode MUST use typed Pydantic events, not raw strings.**
+
+### ✅ CORRECT
+
+```python
+from agent_router.core.events import ThinkingEvent, ToolCallEvent
+
+async def process_stream(self, query: str):
+    yield ThinkingEvent(content="Analyzing query...")
+    yield ToolCallEvent(tool_name="read_file", parameters={"path": "data.txt"})
+```
+
+### ❌ WRONG
+
+```python
+async def process_stream(self, query: str):
+    yield "Analyzing query..."  # Untyped!
+    yield {"type": "tool_call", "tool": "read_file"}  # Dict instead of model!
+```
+
+**Rule**: All streaming events MUST be Pydantic models from `core/events.py`.
+
+---
+
+## Configuration
+
+**Agent personas MUST be in YAML files, not hardcoded.**
+
+### ✅ CORRECT
+
+```python
+# config/agents/router.yaml
+router:
+  background: |
+    You are an intelligent routing agent...
+  goal: |
+    Route user queries to appropriate tools...
+
+# Load in code
+config = AgentConfig.from_yaml("config/agents/router.yaml")
+agent = Agent(config=config)
+```
+
+### ❌ WRONG
+
+```python
+# DON'T hardcode prompts
+agent = Agent(
+    system_prompt="You are a router agent that..."  # Should be in YAML
+)
+```
+
+**Rule**: All agent personas, backgrounds, goals, guidelines MUST be in YAML files under `config/agents/`.
+
+---
+
+## Error Handling Strategy
+
+**Functional recovery belongs to Agent Layer. Technical resilience belongs to LLM Service.**
+
+### ✅ CORRECT
+
+```python
+# In LLM Service - handle technical retry only
+async def generate(self, prompt: str) -> str:
+    try:
+        return await self._call_provider(prompt)
+    except Exception as e:
+        raise LLMProviderError(f"Generation failed: {e}")
+
+# In Agent Layer - decide functional recovery
+async def process_query(self, query: str):
+    try:
+        response = await self.llm_service.generate(prompt)
+    except LLMProviderError as e:
+        # Agent decides: retry tool/agent, alternate tool/agent, ask user, abort, etc.
+        logger.error("LLM failed; deciding next functional step")
+```
+
+### ❌ WRONG
+
+```python
+# DON'T let infrastructure decide
+async def generate(self, prompt: str) -> str:
+    try:
+        return await self.client.generate(prompt)
+    except Exception:
+        # NO! Don't decide here
+        return await self.fallback_provider.generate(prompt)
+```
+
+**Rule**:
+- LLM Service may automatically retry **technical** failures (timeouts, 5xx, rate limits).
+- Agent Layer decides **functional** recovery (change plan, choose different tool/agent, ask user).
+
+---
+
+## Repository Pattern
+
+**All database access MUST go through repositories.**
+
+### ✅ CORRECT
+
+```python
+# storage/repositories/llm_calls.py
+class LLMCallRepository(Repository):
+    async def create(self, data: Dict) -> str:
+        result = await self.collection.insert_one(data)
+        return str(result.inserted_id)
+
+# In Agent Layer
+await self.llm_call_repo.create(llm_call_data)
+```
+
+### ❌ WRONG
+
+```python
+# DON'T access database directly
+await self.mongo_db.llm_calls.insert_one(data)  # Bypasses repository!
+```
+
+**Rule**: No component can access MongoDB directly. All access through repository classes.
+
+---
+
+## Tool & Agent Contracts
+
+**Agents must rely on tool/agent contracts for inputs/outputs.**
+
+### ✅ CORRECT
+```python
+# Tool metadata includes input/output schemas
+tool = ToolSpec(
+    name="read_file",
+    input_schema=ReadFileArgs,
+    output_schema=ReadFileResult
+)
+```
+
+### ❌ WRONG
+```python
+# Agent invents expected output shape
+expected = {"content": "..."}  # Not sourced from tool contract
+```
+
+**Rule**: Input arguments and output shapes come from tool/agent definitions, not Agent assumptions.
+
+---
+
+## Validation Rules
+
+### Input Validation
+
+✅ **DO validate at system boundaries:**
+- User input from CLI/UI
+- External API requests (A2A)
+- File uploads
+- Configuration files
+
+❌ **DON'T validate internal data:**
+- Data passed between Agent → Orchestrator (trust internal code)
+- Repository → Storage (already validated by Pydantic)
+
+### ✅ CORRECT
+
+```python
+# At system boundary (Main Script)
+def main(user_input: str):
+    if not user_input.strip():
+        raise ValueError("Empty input")
+
+    # Now trust it internally
+    result = await agent.process_query(user_input)
+```
+
+### ❌ WRONG
+
+```python
+# Don't re-validate everywhere
+class Orchestrator:
+    async def execute(self, tools: List[Tool]):
+        for tool in tools:
+            if not tool.name:  # Unnecessary - already validated
+                raise ValueError("Missing tool name")
+```
+
+**Rule**: Validate once at boundaries, trust internal data flow.
+
+---
+
+## Testing Strategy
+
+**Each component MUST be independently testable.**
+
+### ✅ CORRECT
+
+```python
+# Test Agent with mocked dependencies
+async def test_agent_routing():
+    mock_llm = Mock(spec=LLMService)
+    mock_orchestrator = Mock(spec=Orchestrator)
+
+    agent = Agent(
+        llm_service=mock_llm,
+        orchestrator=mock_orchestrator
+    )
+
+    await agent.process_query("test query")
+    mock_llm.generate.assert_called_once()
+```
+
+### ❌ WRONG
+
+```python
+# Can't test because Agent creates dependencies
+class Agent:
+    def __init__(self):
+        self.llm = LLMService()  # Can't mock!
+```
+
+**Rule**: Constructor injection makes testing easy. Always inject dependencies.
+
+---
+
+## Enforcement Checklist
+
+Before committing code, verify:
+
+- [ ] Does any component besides Agent Layer make decisions? → ❌ NO
+- [ ] Are LLM calls stored separately from tool executions? → ✅ YES
+- [ ] Do all connectors implement abstract interfaces? → ✅ YES
+- [ ] Do Agent and LLM Service support both streaming modes? → ✅ YES
+- [ ] Are streaming events typed Pydantic models? → ✅ YES
+- [ ] Are agent personas in YAML files? → ✅ YES
+- [ ] Does only Agent Layer decide error recovery? → ✅ YES
+- [ ] Does all database access go through repositories? → ✅ YES
+- [ ] Are dependencies injected via constructor? → ✅ YES
+- [ ] Is input validated only at boundaries? → ✅ YES
+
+**If any check fails, the code violates architecture principles.**

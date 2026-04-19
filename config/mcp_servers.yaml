@@ -2,9 +2,56 @@ servers:
   filesystem:
     command: npx
     args:
+      - "-y"
       - "@modelcontextprotocol/server-filesystem"
       - "."
+    retry_max_retries: 3
+    retry_base_delay: 1.0
+    retry_max_delay: 10.0
+    retry_exponential_base: 2.0
+    call_timeout_seconds: 20
+  brave_search:
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-brave-search"
+    env:
+      BRAVE_API_KEY: "${BRAVE_API_KEY}"
+    min_request_interval_seconds: 1.0
+    sequential_calls: true
+    post_call_delay_seconds: 2.0
+    retry_max_retries: 3
+    retry_base_delay: 1.0
+    retry_max_delay: 10.0
+    retry_exponential_base: 2.0
+    call_timeout_seconds: 30
+  sequential_thinking:
+    command: npx
+    args:
+      - "-y"
+      - "@modelcontextprotocol/server-sequential-thinking"
+    retry_max_retries: 3
+    retry_base_delay: 1.0
+    retry_max_delay: 10.0
+    retry_exponential_base: 2.0
+    call_timeout_seconds: 15
+  playwright:
+    command: npx
+    args:
+      - "-y"
+      - "@playwright/mcp@latest"
+    retry_max_retries: 3
+    retry_base_delay: 1.0
+    retry_max_delay: 10.0
+    retry_exponential_base: 2.0
+    call_timeout_seconds: 60
   everything:
     command: npx
     args:
+      - "-y"
       - "@modelcontextprotocol/server-everything"
+    retry_max_retries: 3
+    retry_base_delay: 1.0
+    retry_max_delay: 10.0
+    retry_exponential_base: 2.0
+    call_timeout_seconds: 30

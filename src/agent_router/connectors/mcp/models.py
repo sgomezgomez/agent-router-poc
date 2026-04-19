@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from agent_router.core.types import JsonObject, JsonValue
+from typing import Literal
 from pydantic import BaseModel, Field
 
 
@@ -31,3 +32,4 @@ class MCPToolResult(BaseModel):
     success: bool
     result: JsonValue | None = None
     error: str | None = None
+    error_type: Literal["technical", "functional"] | None = None

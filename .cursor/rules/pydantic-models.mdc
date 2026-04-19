@@ -1,0 +1,454 @@
+---
+description: Pydantic model patterns and best practices for Agent Router
+globs: src/agent_router/**/*.py
+alwaysApply: true
+---
+
+# Pydantic Models Best Practices
+
+## Model Structure
+
+### Base Model Guidelines
+
+**Always use Pydantic BaseModel** for data validation and serialization:
+
+```python
+from pydantic import BaseModel, Field
+from datetime import datetime
+from uuid import UUID, uuid4
+from typing import Dict, List, Any
+
+# ✅ CORRECT
+class LLMCall(BaseModel):
+    """Model for storing LLM call records."""
+    uuid: UUID = Field(default_factory=uuid4)
+    session_id: UUID
+    system_prompt: str
+    user_prompt: str
+    provider: str
+    model: str
+    response: str | None = None
+    usage: Dict[str, int] | None = None
+    latency_ms: int | None = None
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    error: str | None = None
+
+# ❌ WRONG - Using plain dict
+llm_call = {
+    "uuid": str(uuid4()),
+    "system_prompt": "...",
+    # No validation, no type safety
+}
+```
+
+## UUID Primary Keys
+
+**Use UUID instead of MongoDB ObjectId** for document identification:
+
+```python
+# ✅ CORRECT - UUID as primary key
+from uuid import UUID, uuid4
+
+class LLMCall(BaseModel):
+    uuid: UUID = Field(default_factory=uuid4)
+    session_id: UUID
+    # ...
+
+# When storing to MongoDB, convert UUID to string for _id
+document = item.model_dump(mode="json")
+document["_id"] = str(document["uuid"])
+del document["uuid"]
+await collection.insert_one(document)
+
+# ❌ WRONG - Using ObjectId ties us to MongoDB
+from bson import ObjectId
+
+class LLMCall(BaseModel):
+    id: ObjectId  # Not portable, MongoDB-specific
+```
+
+**Why UUID?**
+- Database agnostic (can switch from MongoDB to PostgreSQL)
+- Predictable type (UUID vs Any)
+- Can generate IDs before database insert
+- Better for distributed systems
+
+## Field Definitions
+
+### Required vs Optional Fields
+
+**Be explicit about required and optional fields**:
+
+```python
+# ✅ CORRECT
+class LLMCall(BaseModel):
+    # Required fields - no default
+    uuid: UUID = Field(default_factory=uuid4)  # Auto-generated
+    system_prompt: str                          # Must be provided
+    user_prompt: str                            # Must be provided
+    provider: str                               # Must be provided
+
+    # Optional fields - with None default
+    response: str | None = None
+    error: str | None = None
+    usage: Dict[str, int] | None = None
+
+    # Optional with default values
+    streaming: bool = False
+    retry_count: int = 0
+
+# ❌ WRONG - Ambiguous optionality
+class LLMCall(BaseModel):
+    provider: str = ""  # Empty string as default? Should be required!
+    response: str       # No default, but could be None during creation
+```
+
+### Field Factories for Dynamic Defaults
+
+**Use `Field(default_factory=...)` for mutable defaults**:
+
+```python
+# ✅ CORRECT
+from datetime import datetime
+from uuid import uuid4
+
+class Session(BaseModel):
+    uuid: UUID = Field(default_factory=uuid4)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    message_history: List[Dict] = Field(default_factory=list)
+
+# ❌ WRONG - Mutable default
+class Session(BaseModel):
+    message_history: List[Dict] = []  # Shared across instances!
+```
+
+## Nested Models
+
+**Use nested Pydantic models for complex structures**:
+
+```python
+# ✅ CORRECT - Type-safe nested models
+class Message(BaseModel):
+    role: str
+    content: str
+    timestamp: datetime
+    tool_calls: List[Dict] | None = None
+
+class Session(BaseModel):
+    uuid: UUID = Field(default_factory=uuid4)
+    messages: List[Message] = Field(default_factory=list)  # Type-safe!
+
+# ❌ WRONG - Untyped nested data
+class Session(BaseModel):
+    messages: List[Dict]  # What's in the dict? No validation!
+```
+
+## MongoDB Serialization
+
+### model_dump() for MongoDB
+
+**Use `model_dump(mode="json")` for MongoDB-compatible serialization**:
+
+```python
+# ✅ CORRECT
+async def create(self, item: T) -> T:
+    collection = await self._get_collection()
+
+    # Convert Pydantic model to MongoDB-compatible dict
+    document = item.model_dump(mode="json")
+
+    # Use UUID as MongoDB _id
+    if "uuid" in document:
+        document["_id"] = str(document["uuid"])
+        del document["uuid"]
+
+    await collection.insert_one(document)
+    return item
+
+# ❌ WRONG - Using dict() deprecated method
+document = item.dict()  # Deprecated in Pydantic v2
+
+# ❌ WRONG - Not handling UUID properly
+document = item.model_dump()
+await collection.insert_one(document)  # UUID objects aren't JSON serializable!
+```
+
+## Type Hints
+
+### Modern Python Type Hints
+
+**Use modern union syntax** (Python 3.10+):
+
+```python
+# ✅ CORRECT - Python 3.10+ union syntax
+class LLMCall(BaseModel):
+    response: str | None = None
+    usage: Dict[str, int] | None = None
+    metadata: Dict[str, Any] | None = None
+
+# ❌ WRONG - Old-style Optional
+from typing import Optional
+
+class LLMCall(BaseModel):
+    response: Optional[str] = None  # Verbose, old syntax
+```
+
+### Literal Types for Enums
+
+**Use Literal for fixed string choices**:
+
+```python
+from typing import Literal
+
+# ✅ CORRECT - Type-safe string choices
+class ToolExecution(BaseModel):
+    tool_type: Literal["mcp_tool", "mcp_agent", "a2a_agent"]
+
+# Also correct - Using Enum
+from enum import Enum
+
+class ToolType(str, Enum):
+    MCP_TOOL = "mcp_tool"
+    MCP_AGENT = "mcp_agent"
+    A2A_AGENT = "a2a_agent"
+
+class ToolExecution(BaseModel):
+    tool_type: ToolType
+
+# ❌ WRONG - Plain string, no validation
+class ToolExecution(BaseModel):
+    tool_type: str  # Could be anything!
+```
+
+## Field Descriptions
+
+**Add descriptions for documentation**:
+
+```python
+# ✅ CORRECT - Well-documented model
+class LLMCall(BaseModel):
+    """Model for storing LLM call records. Stored BY Agent Layer."""
+
+    uuid: UUID = Field(
+        default_factory=uuid4,
+        description="Unique identifier for this LLM call"
+    )
+    system_prompt: str = Field(
+        description="System prompt sent to the LLM"
+    )
+    user_prompt: str = Field(
+        description="User query or prompt"
+    )
+    provider: str = Field(
+        description="LLM provider used (openai, gemini, lm_studio, grok)"
+    )
+    streaming: bool = Field(
+        default=False,
+        description="Whether this was a streaming call"
+    )
+
+# ❌ WRONG - No documentation
+class LLMCall(BaseModel):
+    uuid: UUID = Field(default_factory=uuid4)
+    system_prompt: str
+    user_prompt: str
+```
+
+## Model Configuration
+
+**Configure Pydantic behavior** using `model_config`:
+
+```python
+from pydantic import ConfigDict
+
+# ✅ CORRECT - Explicit configuration
+class LLMCall(BaseModel):
+    model_config = ConfigDict(
+        str_strip_whitespace=True,     # Strip whitespace from strings
+        validate_assignment=True,       # Validate on assignment after creation
+        use_enum_values=True,          # Use enum values instead of enum objects
+        populate_by_name=True,         # Allow both field name and alias
+    )
+
+    uuid: UUID = Field(default_factory=uuid4)
+    provider: str
+```
+
+## Repository Integration
+
+**Pattern for Pydantic models with repositories**:
+
+```python
+from abc import ABC
+from typing import Generic, TypeVar
+from motor.motor_asyncio import AsyncIOMotorCollection
+
+T = TypeVar('T', bound=BaseModel)
+
+class BaseRepository(ABC, Generic[T]):
+    """Abstract base repository with generic CRUD operations."""
+
+    def __init__(self, collection: AsyncIOMotorCollection):
+        self.collection = collection
+
+    @abstractmethod
+    def collection_name(self) -> str:
+        """Return the collection name."""
+        pass
+
+    @abstractmethod
+    def model_class(self) -> type[T]:
+        """Return the Pydantic model class."""
+        pass
+
+    async def create(self, item: T) -> T:
+        """Create document with auto-generated UUID."""
+        document = item.model_dump(mode="json")
+
+        # Use UUID as MongoDB _id
+        if "uuid" in document:
+            document["_id"] = str(document["uuid"])
+            del document["uuid"]
+
+        await self.collection.insert_one(document)
+        return item
+
+    async def get(self, uuid: UUID) -> T | None:
+        """Get document by UUID."""
+        document = await self.collection.find_one({"_id": str(uuid)})
+
+        if document:
+            # Convert _id back to uuid
+            document["uuid"] = document.pop("_id")
+            return self.model_class()(**document)
+
+        return None
+```
+
+## Validation
+
+**Custom validators for business logic**:
+
+```python
+from pydantic import field_validator, model_validator
+
+class LLMCall(BaseModel):
+    provider: str
+    model: str
+    temperature: float | None = None
+
+    @field_validator('temperature')
+    @classmethod
+    def validate_temperature(cls, v: float | None) -> float | None:
+        """Ensure temperature is in valid range."""
+        if v is not None and (v < 0 or v > 2):
+            raise ValueError('temperature must be between 0 and 2')
+        return v
+
+    @model_validator(mode='after')
+    def validate_provider_model(self):
+        """Validate model is compatible with provider."""
+        if self.provider == "openai" and not self.model.startswith("gpt"):
+            raise ValueError(f"Invalid OpenAI model: {self.model}")
+        return self
+```
+
+## Common Patterns
+
+### Timestamp Fields
+
+```python
+from datetime import datetime
+
+class BaseDocument(BaseModel):
+    """Base model for all MongoDB documents."""
+    uuid: UUID = Field(default_factory=uuid4)
+    created_at: datetime = Field(default_factory=datetime.utcnow)
+    updated_at: datetime = Field(default_factory=datetime.utcnow)
+
+class LLMCall(BaseDocument):
+    """Inherits timestamp fields."""
+    system_prompt: str
+    # ...
+```
+
+### Usage Statistics
+
+```python
+class LLMCall(BaseModel):
+    usage: Dict[str, int] | None = Field(
+        default=None,
+        description="Token usage statistics",
+        examples=[
+            {"prompt_tokens": 150, "completion_tokens": 50, "total_tokens": 200}
+        ]
+    )
+```
+
+### Error Tracking
+
+```python
+class ToolExecution(BaseModel):
+    tool_name: str
+    parameters: Dict[str, Any]
+    result: Dict[str, Any] | None = None
+    error: str | None = None
+    status: Literal["success", "error", "pending"] = "pending"
+
+    @property
+    def is_success(self) -> bool:
+        """Check if execution was successful."""
+        return self.status == "success" and self.error is None
+```
+
+## Testing Models
+
+**Unit tests for Pydantic models**:
+
+```python
+import pytest
+from uuid import UUID
+from datetime import datetime
+
+def test_llm_call_creation():
+    """Test LLM call model creation."""
+    call = LLMCall(
+        session_id=uuid4(),
+        system_prompt="You are a helpful assistant",
+        user_prompt="Hello",
+        provider="openai",
+        model="gpt-4"
+    )
+
+    assert isinstance(call.uuid, UUID)
+    assert isinstance(call.timestamp, datetime)
+    assert call.streaming is False  # Default value
+    assert call.error is None
+
+def test_llm_call_validation():
+    """Test model validation."""
+    with pytest.raises(ValueError):
+        LLMCall(
+            session_id=uuid4(),
+            system_prompt="Test",
+            user_prompt="Test",
+            provider="openai",
+            model="gpt-4",
+            temperature=3.0  # Invalid! Must be 0-2
+        )
+```
+
+## Checklist
+
+Before creating a new Pydantic model:
+
+- [ ] Use `BaseModel` from Pydantic
+- [ ] Use `UUID` for primary keys, not ObjectId
+- [ ] Be explicit about required vs optional fields
+- [ ] Use `Field(default_factory=...)` for mutable defaults
+- [ ] Add docstrings and field descriptions
+- [ ] Use modern type hints (str | None, not Optional[str])
+- [ ] Use Literal for fixed string choices
+- [ ] Add custom validators for business logic
+- [ ] Test model creation and validation
+- [ ] Document serialization behavior for MongoDB

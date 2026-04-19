@@ -1,0 +1,277 @@
+---
+description: MongoDB configuration best practices and known issues
+globs: src/agent_router/storage/**/*.py
+alwaysApply: false
+---
+
+# MongoDB Configuration Best Practices
+
+## Critical Configuration Requirements
+
+### 1. Disable Retryable Writes for Standalone Instances
+
+**Issue**: Standalone MongoDB (not replica sets) can cause authentication errors if retryable writes are enabled.
+
+**Solution**: Always include `retryWrites=false` in the connection string.
+
+```python
+# ✅ CORRECT
+MONGODB__URI=mongodb://localhost:27017/?retryWrites=false
+
+# ❌ WRONG - Will cause auth issues on standalone instances
+MONGODB__URI=mongodb://localhost:27017/
+```
+
+### 2. authSource Must Match User Database
+
+**Issue**: The `authSource` parameter must be the database where the user was created, not necessarily `admin`.
+
+**Solution**: Set `authSource` to match the target database where the user account exists.
+
+```python
+# ✅ CORRECT - authSource matches where user was created
+from urllib.parse import quote_plus
+username = quote_plus('agentrouteradmin')
+password = quote_plus('Q4v!nT8@zK2#Lm7$Xp6^R3sH')
+
+auth_uri = f"mongodb://{username}:{password}@localhost:27017/agent_router_db?authSource=agent_router_db&retryWrites=false"
+
+# ❌ WRONG - Using admin as authSource when user was created in agent_router_db
+auth_uri = f"mongodb://{username}:{password}@localhost:27017/agent_router_db?authSource=admin&retryWrites=false"
+```
+
+**Implementation Pattern**:
+```python
+# src/agent_router/storage/db.py
+if config.username and config.password:
+    from urllib.parse import quote_plus
+    username = quote_plus(config.username)
+    password = quote_plus(config.password)
+
+    # Parse base URI and add credentials
+    if "://" in config.uri:
+        protocol, rest = config.uri.split("://", 1)
+        # Use the target database as authSource (where user was created)
+        auth_uri = f"{protocol}://{username}:{password}@{rest.split('?')[0]}?authSource={config.database}&retryWrites=false"
+        instance._client = AsyncIOMotorClient(auth_uri, **client_args)
+```
+
+### 3. URL Encode Credentials
+
+**Issue**: Special characters in passwords cause connection string parsing errors.
+
+**Solution**: Always URL-encode both username and password using `urllib.parse.quote_plus()`.
+
+```python
+# ✅ CORRECT
+from urllib.parse import quote_plus
+
+username = quote_plus('agentrouteradmin')
+password = quote_plus('Q4v!nT8@zK2#Lm7$Xp6^R3sH')  # Encodes special chars
+# Result: Q4v%21nT8%40zK2%23Lm7%24Xp6%5ER3sH
+
+# ❌ WRONG - Special characters will break connection
+password = 'Q4v!nT8@zK2#Lm7$Xp6^R3sH'  # Raw password with special chars
+```
+
+### 4. Connection String Format
+
+**With Authentication**:
+```python
+mongodb://username:password@localhost:27017/database?authSource=database&retryWrites=false
+```
+
+**Without Authentication** (development only):
+```python
+mongodb://localhost:27017/?retryWrites=false
+```
+
+## Environment Configuration
+
+**Required variables** (.env):
+```bash
+MONGODB__URI=mongodb://localhost:27017/?retryWrites=false
+MONGODB__DATABASE=agent_router_db
+MONGODB__USERNAME=your_username
+MONGODB__PASSWORD=your_password
+```
+
+**Configuration Class**:
+```python
+# src/agent_router/core/config.py
+class MongoDBConfig(BaseModel):
+    """MongoDB configuration."""
+    uri: str = "mongodb://localhost:27017"
+    database: str = "agent_router"
+    username: str | None = None
+    password: str | None = None
+    max_pool_size: int = 10
+    min_pool_size: int = 1
+```
+
+## Setup Process
+
+1. **Install MongoDB locally** (Docker has authentication issues with PyMongo 4.16.0 + Motor 3.7.1)
+2. **Create database** in MongoDB Compass
+3. **Create user in that database** (not in admin database)
+4. **Configure credentials** in `.env` file
+5. **Test connection** before running application
+
+**MongoDB Compass Setup**:
+```
+1. Open MongoDB Compass
+2. Connect to localhost:27017
+3. Create database: agent_router_db
+4. Create user:
+   - Database: agent_router_db
+   - Username: agentrouteradmin
+   - Password: [secure password]
+   - Role: readWrite on agent_router_db
+```
+
+## Known Issues
+
+### PyMongo 4.16.0 + Motor 3.7.1 with Docker MongoDB
+
+**Issue**: Authentication errors occur with Docker MongoDB on standalone instances, even when auth is disabled.
+
+**Error Message**: `"Command insert requires authentication"`
+
+**Root Cause**: Likely incompatibility between PyMongo 4.16.0, Motor 3.7.1, Python 3.13, and Docker MongoDB standalone instances with retryable writes.
+
+**Solution**: Use local MongoDB installation instead of Docker for development.
+
+**Alternative Workaround** (if Docker is required):
+- Use MongoDB 5.x instead of 7.x
+- Ensure MongoDB is started with `--noauth` flag
+- Consider using replica set configuration
+
+## Connection Manager Pattern
+
+**Singleton Pattern** for MongoDB connection:
+```python
+# src/agent_router/storage/db.py
+class MongoDBConnection:
+    """Singleton MongoDB connection manager."""
+
+    _instance: Optional["MongoDBConnection"] = None
+    _client: Optional[AsyncIOMotorClient] = None
+    _database: Optional[AsyncIOMotorDatabase] = None
+
+    def __new__(cls):
+        """Ensure only one instance exists (Singleton pattern)."""
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+
+    @classmethod
+    async def initialize(cls, config: MongoDBConfig) -> "MongoDBConnection":
+        """Initialize the MongoDB connection."""
+        instance = cls()
+
+        if instance._client is None:
+            # Build authenticated connection string
+            username = quote_plus(config.username)
+            password = quote_plus(config.password)
+            protocol, rest = config.uri.split("://", 1)
+
+            auth_uri = f"{protocol}://{username}:{password}@{rest.split('?')[0]}?authSource={config.database}&retryWrites=false"
+            instance._client = AsyncIOMotorClient(auth_uri, **client_args)
+            instance._database = instance._client[config.database]
+
+            # Test connection
+            await instance._client.admin.command('ping')
+
+        return instance
+```
+
+## Connection Pooling
+
+**Best Practices**:
+```python
+client_args = {
+    "maxPoolSize": 10,      # Maximum concurrent connections
+    "minPoolSize": 1,       # Minimum idle connections
+}
+
+instance._client = AsyncIOMotorClient(auth_uri, **client_args)
+```
+
+## Index Creation
+
+**Create indexes on application startup** for performance:
+```python
+@classmethod
+async def create_indexes(cls):
+    """Create necessary indexes for performance."""
+    db = cls.get_database()
+
+    # LLM calls indexes
+    await db.llm_calls.create_index("session_id")
+    await db.llm_calls.create_index("timestamp")
+    await db.llm_calls.create_index("provider")
+    await db.llm_calls.create_index([("session_id", 1), ("timestamp", -1)])
+
+    # Tool executions indexes
+    await db.tool_executions.create_index("session_id")
+    await db.tool_executions.create_index("timestamp")
+    await db.tool_executions.create_index("tool_name")
+    await db.tool_executions.create_index([("session_id", 1), ("timestamp", -1)])
+
+    # Session indexes
+    await db.sessions.create_index("created_at")
+    await db.sessions.create_index("last_updated")
+```
+
+## Testing MongoDB Connection
+
+**Test script**:
+```python
+import asyncio
+from urllib.parse import quote_plus
+from motor.motor_asyncio import AsyncIOMotorClient
+
+async def test():
+    username = quote_plus('agentrouteradmin')
+    password = quote_plus('Q4v!nT8@zK2#Lm7$Xp6^R3sH')
+
+    client = AsyncIOMotorClient(
+        f'mongodb://{username}:{password}@localhost:27017/agent_router_db?authSource=agent_router_db&retryWrites=false'
+    )
+
+    try:
+        await client.admin.command('ping')
+        print('SUCCESS! Connected to MongoDB')
+
+        # Test insert
+        db = client.agent_router_db
+        result = await db.test_collection.insert_one({'test': 'data'})
+        print(f'Inserted ID: {result.inserted_id}')
+
+    except Exception as e:
+        print(f'Failed: {e}')
+    finally:
+        client.close()
+
+asyncio.run(test())
+```
+
+## References
+
+- **Motor Documentation**: https://motor.readthedocs.io/
+- **PyMongo Authentication**: https://pymongo.readthedocs.io/en/stable/examples/authentication.html
+- **MongoDB Connection String Format**: https://www.mongodb.com/docs/manual/reference/connection-string/
+- **URL Encoding**: https://docs.python.org/3/library/urllib.parse.html#urllib.parse.quote_plus
+
+## Checklist
+
+Before deploying MongoDB configuration:
+
+- [ ] `retryWrites=false` included in connection string
+- [ ] `authSource` matches database where user was created
+- [ ] Credentials are URL-encoded using `quote_plus()`
+- [ ] Local MongoDB installation (not Docker) for development
+- [ ] Database and user created in MongoDB Compass
+- [ ] Connection tested with simple insert operation
+- [ ] Indexes created on application startup
+- [ ] Connection pooling configured appropriately

@@ -15,3 +15,22 @@ router:
   guardrails: |
     - Do not invent tool outputs.
     - Follow tool contracts for inputs/outputs.
+  provider: lm_studio
+  model: null
+  api_mode: null
+  temperature: null
+  top_p: null
+  top_k: null
+  max_tokens: null
+  thinking_budget: 1024
+  thinking_effort: null
+  enable_thinking: null
+  max_tool_iterations: 25
+  stream_tool_planning: true
+  allowed_mcp_servers:
+    - filesystem
+    - brave_search
+    - sequential_thinking
+    - playwright
+  allowed_mcp_agents: []
+  allowed_a2a_agents: []

@@ -6,19 +6,12 @@ Run with: python tests/manual/test_mcp_servers.py
 import asyncio
 from pathlib import Path
 
-import yaml
-
-from agent_router.connectors.mcp import MCPClient
+from agent_router.connectors.mcp import MCPClient, load_mcp_server_configs
 
 
 async def main() -> int:
     config_path = Path(__file__).resolve().parents[2] / "config" / "mcp_servers.yaml"
-    if not config_path.exists():
-        print("[FAIL] config/mcp_servers.yaml not found")
-        return 1
-
-    config = yaml.safe_load(config_path.read_text()) or {}
-    servers = config.get("servers", {})
+    servers = load_mcp_server_configs(config_path)
     if not servers:
         print("[FAIL] No MCP servers configured")
         return 1

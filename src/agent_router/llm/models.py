@@ -9,7 +9,7 @@ from agent_router.core.types import JsonObject, JsonValue
 class Message(BaseModel):
     """Single message in a conversation."""
     role: str = Field(description="Message role: system, user, or assistant")
-    content: str = Field(description="Message content")
+    content: str | None = Field(description="Message content (can be null for tool-call assistant messages)")
     tool_calls: List[JsonObject] | None = Field(
         default=None,
         description="Tool calls requested by the assistant"
@@ -59,6 +59,10 @@ class LLMRequest(BaseModel):
     thinking_effort: Literal["low", "medium", "high"] | None = Field(
         default=None,
         description="Reasoning effort level for models that support it"
+    )
+    enable_thinking: bool | None = Field(
+        default=None,
+        description="Tri-state thinking override: true/false to force, null to use model defaults"
     )
 
     # Tool use

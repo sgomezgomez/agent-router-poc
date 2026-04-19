@@ -1,5 +1,9 @@
 """Google Gemini provider implementation using modern google-genai SDK."""
 
+import hashlib
+import ast
+import json
+import re
 import time
 from typing import AsyncIterator
 from google import genai
@@ -72,6 +76,7 @@ class GeminiProvider(BaseLLMProvider):
         """
         system_instruction = None
         contents = []
+        tool_call_id_to_name: dict[str, str] = {}
 
         for msg in request.messages:
             if msg.role == "system":
@@ -84,18 +89,49 @@ class GeminiProvider(BaseLLMProvider):
                 ))
             elif msg.role == "assistant":
                 # Gemini uses "model" role instead of "assistant"
-                contents.append(types.Content(
-                    role="model",
-                    parts=[types.Part(text=clean_encoded_text(msg.content))]
-                ))
+                model_parts: list[types.Part] = []
+                text_content = clean_encoded_text(msg.content)
+                if text_content:
+                    model_parts.append(types.Part(text=text_content))
+
+                if msg.tool_calls:
+                    for tc in msg.tool_calls:
+                        if not isinstance(tc, dict):
+                            continue
+                        tc_id = tc.get("id")
+                        fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+                        fn_name = fn.get("name")
+                        if not isinstance(fn_name, str) or not fn_name:
+                            continue
+
+                        if isinstance(tc_id, str) and tc_id:
+                            tool_call_id_to_name[tc_id] = fn_name
+
+                        raw_args = fn.get("arguments")
+                        parsed_args = self._parse_function_args_object(raw_args)
+                        model_parts.append(
+                            types.Part(
+                                function_call=types.FunctionCall(
+                                    name=fn_name,
+                                    args=parsed_args,
+                                )
+                            )
+                        )
+
+                if model_parts:
+                    contents.append(types.Content(
+                        role="model",
+                        parts=model_parts,
+                    ))
             elif msg.role == "tool":
                 # Tool response message
                 if msg.tool_call_id and msg.content:
+                    function_name = tool_call_id_to_name.get(msg.tool_call_id, msg.tool_call_id)
                     contents.append(types.Content(
                         role="function",
                         parts=[types.Part(
                             function_response=types.FunctionResponse(
-                                name=msg.tool_call_id,
+                                name=function_name,
                                 response={"result": msg.content}
                             )
                         )]
@@ -106,7 +142,7 @@ class GeminiProvider(BaseLLMProvider):
     def _build_generation_config(
         self,
         request: LLMRequest
-    ) -> types.GenerateContentConfig:
+    ) -> tuple[types.GenerateContentConfig | None, dict[str, str]]:
         """Build generation configuration for Gemini.
 
         Args:
@@ -116,6 +152,7 @@ class GeminiProvider(BaseLLMProvider):
             GenerateContentConfig object
         """
         config_kwargs = {}
+        tool_name_map: dict[str, str] = {}
 
         # Temperature
         if request.temperature is not None:
@@ -142,7 +179,7 @@ class GeminiProvider(BaseLLMProvider):
 
         # Tools (function calling)
         if request.tools:
-            normalized_tools = self._normalize_tools(request.tools)
+            normalized_tools, tool_name_map = self._normalize_tools(request.tools)
             if normalized_tools:
                 config_kwargs["tools"] = normalized_tools
             # Disable automatic function calling (agent layer handles it)
@@ -156,35 +193,167 @@ class GeminiProvider(BaseLLMProvider):
                 thinking_budget=request.thinking_budget
             )
 
-        return types.GenerateContentConfig(**config_kwargs) if config_kwargs else None
+        return (
+            types.GenerateContentConfig(**config_kwargs) if config_kwargs else None,
+            tool_name_map,
+        )
 
-    def _normalize_tools(self, tools: list) -> list[types.Tool] | None:
+    def _sanitize_function_name(self, name: str) -> str:
+        """Gemini requires conservative function names; MCP uses namespace separators."""
+        sanitized = re.sub(r"[^A-Za-z0-9_]", "_", name or "")
+        if sanitized and sanitized[0].isdigit():
+            sanitized = f"f_{sanitized}"
+        sanitized = re.sub(r"_+", "_", sanitized).strip("_")
+        return sanitized[:64] or "tool_fn"
+
+    def _normalize_tools(self, tools: list) -> tuple[list[types.Tool] | None, dict[str, str]]:
         """Normalize OpenAI-style tool dicts into Gemini Tool objects."""
         if not tools:
-            return None
+            return None, {}
 
         if isinstance(tools[0], types.Tool):
-            return tools
+            return tools, {}
 
         function_decls = []
+        sanitized_to_original: dict[str, str] = {}
+        used_sanitized: set[str] = set()
         for tool in tools:
             if not isinstance(tool, dict) or tool.get("type") != "function":
                 continue
             function = tool.get("function") or {}
-            if not function.get("name"):
+            original_name = function.get("name")
+            if not original_name:
                 continue
+            sanitized_name = self._sanitize_function_name(original_name)
+            if sanitized_name in used_sanitized and sanitized_to_original.get(sanitized_name) != original_name:
+                suffix = hashlib.md5(original_name.encode("utf-8")).hexdigest()[:8]
+                base = sanitized_name[: max(1, 64 - 9)]
+                sanitized_name = f"{base}_{suffix}"
+            used_sanitized.add(sanitized_name)
+            sanitized_to_original[sanitized_name] = original_name
             function_decls.append(
                 types.FunctionDeclaration(
-                    name=function.get("name"),
+                    name=sanitized_name,
                     description=function.get("description"),
                     parametersJsonSchema=function.get("parameters"),
                 )
             )
 
         if not function_decls:
-            return None
+            return None, {}
 
-        return [types.Tool(function_declarations=function_decls)]
+        return [types.Tool(function_declarations=function_decls)], sanitized_to_original
+
+    def _serialize_function_args(self, args: object) -> str:
+        """Return valid JSON string for function arguments."""
+        if args is None:
+            return "{}"
+        if isinstance(args, str):
+            text = args.strip()
+            if not text:
+                return "{}"
+            # Already JSON
+            try:
+                parsed = json.loads(text)
+                return json.dumps(parsed, ensure_ascii=False)
+            except Exception:
+                pass
+            # Python literal dict/list -> JSON
+            try:
+                parsed = ast.literal_eval(text)
+                return json.dumps(parsed, ensure_ascii=False)
+            except Exception:
+                return text
+
+        try:
+            return json.dumps(args, ensure_ascii=False)
+        except Exception:
+            try:
+                return json.dumps(dict(args), ensure_ascii=False)  # type: ignore[arg-type]
+            except Exception:
+                return "{}"
+
+    def _parse_function_args_object(self, args: object) -> dict:
+        """Return arguments as dict for Gemini FunctionCall args."""
+        if args is None:
+            return {}
+        if isinstance(args, dict):
+            return args
+        if isinstance(args, str):
+            text = args.strip()
+            if not text:
+                return {}
+            try:
+                parsed = json.loads(text)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                pass
+            try:
+                parsed = ast.literal_eval(text)
+                return parsed if isinstance(parsed, dict) else {}
+            except Exception:
+                return {}
+        try:
+            maybe_dict = dict(args)  # type: ignore[arg-type]
+            return maybe_dict if isinstance(maybe_dict, dict) else {}
+        except Exception:
+            return {}
+
+    def _safe_int(self, value: object) -> int:
+        try:
+            return int(value) if value is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def _iter_candidate_parts(self, response_obj):
+        candidates = getattr(response_obj, "candidates", None) or []
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            parts = getattr(content, "parts", None) or []
+            for part in parts:
+                yield part
+
+    def _extract_reasoning_text(self, response_obj, *, numbered: bool) -> str | None:
+        thoughts: list[str] = []
+        for part in self._iter_candidate_parts(response_obj):
+            if hasattr(part, "thought") and part.thought:
+                text = getattr(part, "text", None)
+                thoughts.append(text if isinstance(text, str) else str(part.thought))
+        if not thoughts:
+            return None
+        if numbered:
+            return "\n".join(f"Thought {i+1}: {t}" for i, t in enumerate(thoughts))
+        return "\n".join(thoughts)
+
+    def _extract_visible_text(self, response_obj) -> str:
+        """Best-effort visible assistant text from candidate parts."""
+        texts: list[str] = []
+        for part in self._iter_candidate_parts(response_obj):
+            text = getattr(part, "text", None)
+            if not isinstance(text, str) or not text.strip():
+                continue
+            # Keep reasoning extraction separate from visible output text.
+            if hasattr(part, "thought") and part.thought:
+                continue
+            texts.append(text)
+        return "\n".join(texts).strip()
+
+    def _extract_tool_calls(self, response_obj, tool_name_map: dict[str, str]) -> list[dict] | None:
+        function_calls: list[dict] = []
+        for part in self._iter_candidate_parts(response_obj):
+            if hasattr(part, "function_call") and part.function_call:
+                fc = part.function_call
+                function_calls.append(
+                    {
+                        "id": getattr(fc, "id", fc.name),
+                        "type": "function",
+                        "function": {
+                            "name": tool_name_map.get(fc.name, fc.name),
+                            "arguments": self._serialize_function_args(fc.args) if hasattr(fc, "args") else "{}",
+                        },
+                    }
+                )
+        return function_calls or None
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         """Generate response from Gemini.
@@ -207,7 +376,7 @@ class GeminiProvider(BaseLLMProvider):
             system_instruction, contents = self._format_messages(request)
 
             # Build config
-            config = self._build_generation_config(request)
+            config, tool_name_map = self._build_generation_config(request)
 
             # Add system instruction to config if present
             if system_instruction and config:
@@ -226,49 +395,24 @@ class GeminiProvider(BaseLLMProvider):
 
             # Extract content
             content = response.text if hasattr(response, 'text') else ""
+            if content is None:
+                content = ""
+            if not content.strip():
+                content = self._extract_visible_text(response)
 
             # Extract usage metadata
             usage = None
             if hasattr(response, 'usage_metadata') and response.usage_metadata:
                 metadata = response.usage_metadata
                 usage = {
-                    "prompt_tokens": getattr(metadata, 'prompt_token_count', 0),
-                    "completion_tokens": getattr(metadata, 'candidates_token_count', 0),
-                    "total_tokens": getattr(metadata, 'total_token_count', 0),
+                    "prompt_tokens": self._safe_int(getattr(metadata, 'prompt_token_count', 0)),
+                    "completion_tokens": self._safe_int(getattr(metadata, 'candidates_token_count', 0)),
+                    "total_tokens": self._safe_int(getattr(metadata, 'total_token_count', 0)),
                 }
 
-            # Extract reasoning (thinking) for Gemini 2.5+
-            reasoning = None
-            if hasattr(response, 'candidates') and response.candidates:
-                candidate = response.candidates[0]
-                if hasattr(candidate, 'content') and candidate.content:
-                    # Extract thoughts from parts
-                    thoughts = []
-                    for part in candidate.content.parts:
-                        if hasattr(part, 'thought') and part.thought:
-                            thoughts.append(part.text if hasattr(part, 'text') else str(part.thought))
-                    if thoughts:
-                        reasoning = "\n".join(f"Thought {i+1}: {t}" for i, t in enumerate(thoughts))
-
-            # Extract tool calls (function calls)
-            tool_calls = None
-            if hasattr(response, 'candidates') and response.candidates:
-                candidate = response.candidates[0]
-                if hasattr(candidate, 'content') and candidate.content:
-                    function_calls = []
-                    for part in candidate.content.parts:
-                        if hasattr(part, 'function_call') and part.function_call:
-                            fc = part.function_call
-                            function_calls.append({
-                                "id": getattr(fc, 'id', fc.name),  # Use name as fallback
-                                "type": "function",
-                                "function": {
-                                    "name": fc.name,
-                                    "arguments": str(fc.args) if hasattr(fc, 'args') else "{}"
-                                }
-                            })
-                    if function_calls:
-                        tool_calls = function_calls
+            # Extract reasoning/tool calls across all candidates.
+            reasoning = self._extract_reasoning_text(response, numbered=True)
+            tool_calls = self._extract_tool_calls(response, tool_name_map)
 
             # Use base class helper to build response
             return self._build_response(
@@ -308,7 +452,7 @@ class GeminiProvider(BaseLLMProvider):
             system_instruction, contents = self._format_messages(request)
 
             # Build config
-            config = self._build_generation_config(request)
+            config, tool_name_map = self._build_generation_config(request)
 
             # Add system instruction to config if present
             if system_instruction and config:
@@ -327,36 +471,28 @@ class GeminiProvider(BaseLLMProvider):
             async for chunk in stream:
                 # Extract content
                 content = chunk.text if hasattr(chunk, 'text') else ""
+                if content is None:
+                    content = ""
+                if not content.strip():
+                    content = self._extract_visible_text(chunk)
 
-                # Extract finish reason
+                # Extract finish reason (first available candidate finish reason)
                 finish_reason = None
-                if hasattr(chunk, 'candidates') and chunk.candidates:
-                    candidate = chunk.candidates[0]
-                    if hasattr(candidate, 'finish_reason'):
-                        finish_reason = str(candidate.finish_reason)
+                candidates = getattr(chunk, "candidates", None) or []
+                for candidate in candidates:
+                    value = getattr(candidate, "finish_reason", None)
+                    if value is not None:
+                        finish_reason = str(value)
+                        break
 
-                # Extract tool calls from chunk
-                tool_calls = None
-                if hasattr(chunk, 'candidates') and chunk.candidates:
-                    candidate = chunk.candidates[0]
-                    if hasattr(candidate, 'content') and candidate.content:
-                        function_calls = []
-                        for part in candidate.content.parts:
-                            if hasattr(part, 'function_call') and part.function_call:
-                                fc = part.function_call
-                                function_calls.append({
-                                    "id": getattr(fc, 'id', fc.name),
-                                    "type": "function",
-                                    "function": {
-                                        "name": fc.name,
-                                        "arguments": str(fc.args) if hasattr(fc, 'args') else "{}"
-                                    }
-                                })
-                        if function_calls:
-                            tool_calls = function_calls
+                # Extract reasoning/tool calls across all candidates.
+                reasoning = self._extract_reasoning_text(chunk, numbered=False)
+                tool_calls = self._extract_tool_calls(chunk, tool_name_map)
 
                 yield LLMStreamChunk(
                     content=content,
+                    reasoning=reasoning,
+                    is_reasoning=bool(reasoning and not content),
                     finish_reason=finish_reason,
                     tool_calls=tool_calls
                 )

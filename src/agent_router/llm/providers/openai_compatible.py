@@ -12,6 +12,7 @@ All configuration (API keys, base URLs) comes from Settings/environment variable
 """
 
 import logging
+import os
 import time
 from typing import AsyncIterator
 from openai import AsyncOpenAI
@@ -123,9 +124,16 @@ class OpenAICompatibleProvider(BaseLLMProvider):
     def _apply_provider_toggles(self, request: LLMRequest, api_kwargs: dict) -> None:
         """Apply provider-specific boolean toggles from the model registry."""
         capabilities = self._get_model_capabilities(request)
-        if capabilities and capabilities.enable_thinking is True:
+        if capabilities and capabilities.supports_enable_thinking is not True:
+            if request.enable_thinking is not None or capabilities.supports_enable_thinking is False:
+                logger.warning(
+                    f"{self.provider_name}:{self._get_model(request)} does not explicitly support enable_thinking"
+                )
+            return
+        enable_thinking = request.enable_thinking
+        if enable_thinking is not None:
             extra_body = api_kwargs.get("extra_body") or {}
-            extra_body["enableThinking"] = True
+            extra_body["enableThinking"] = bool(enable_thinking)
             api_kwargs["extra_body"] = extra_body
 
     def _normalize_tools_for_api(self, request: LLMRequest, api_mode: str) -> None:
@@ -135,8 +143,18 @@ class OpenAICompatibleProvider(BaseLLMProvider):
         capabilities = self._get_model_capabilities(request)
         tool_schema = capabilities.tool_schema if capabilities else None
 
+        def _as_dict(tool: dict) -> dict:
+            if isinstance(tool, dict):
+                return tool
+            if hasattr(tool, "model_dump"):
+                return tool.model_dump(mode="json")
+            if hasattr(tool, "dict"):
+                return tool.dict()
+            return {}
+
         def to_chat_schema(tool: dict) -> dict:
-            if tool.get("type") == "function" and "function" in tool:
+            tool = _as_dict(tool)
+            if tool.get("type") == "function" and isinstance(tool.get("function"), dict):
                 return tool
             return {
                 "type": "function",
@@ -148,6 +166,7 @@ class OpenAICompatibleProvider(BaseLLMProvider):
             }
 
         def to_responses_schema(tool: dict) -> dict:
+            tool = _as_dict(tool)
             if "name" in tool and "parameters" in tool and "function" not in tool:
                 return tool
             function = tool.get("function") or {}
@@ -158,8 +177,30 @@ class OpenAICompatibleProvider(BaseLLMProvider):
                 "parameters": function.get("parameters"),
             }
 
-        if api_mode == "chat_completions":
-            request.tools = [to_chat_schema(tool) for tool in request.tools]
+        force_chat_schema = self.provider_name == "lm_studio"
+        if api_mode == "chat_completions" or force_chat_schema:
+            normalized = []
+            for tool in request.tools:
+                tool = to_chat_schema(tool)
+                if not isinstance(tool.get("function"), dict):
+                    name = tool.get("name") or (tool.get("function") or {}).get("name")
+                    parameters = tool.get("parameters") or (tool.get("function") or {}).get("parameters")
+                    tool = {
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "description": tool.get("description"),
+                            "parameters": parameters,
+                        },
+                    }
+                if "function" not in tool:
+                    tool["function"] = {
+                        "name": tool.get("name"),
+                        "description": tool.get("description"),
+                        "parameters": tool.get("parameters"),
+                    }
+                normalized.append(tool)
+            request.tools = normalized
         else:
             if tool_schema == "chat_completions":
                 request.tools = [to_chat_schema(tool) for tool in request.tools]
@@ -223,6 +264,28 @@ class OpenAICompatibleProvider(BaseLLMProvider):
             api_kwargs["max_output_tokens"] = api_kwargs.pop("max_completion_tokens")
         if "max_tokens" in api_kwargs:
             api_kwargs["max_output_tokens"] = api_kwargs.pop("max_tokens")
+
+    def _extract_responses_reasoning(self, response_obj) -> str | None:
+        """Extract reasoning text from Responses API payloads when available."""
+        try:
+            payload = response_obj.model_dump() if hasattr(response_obj, "model_dump") else {}
+            output = payload.get("output") or []
+            parts: list[str] = []
+            for item in output:
+                if not isinstance(item, dict):
+                    continue
+                if item.get("type") != "reasoning":
+                    continue
+                content = item.get("content") or []
+                for block in content:
+                    if not isinstance(block, dict):
+                        continue
+                    text = block.get("text")
+                    if text:
+                        parts.append(str(text))
+            return "".join(parts) if parts else None
+        except Exception:
+            return None
 
     async def generate(self, request: LLMRequest) -> LLMResponse:
         """Generate response from OpenAI-compatible API.
@@ -294,6 +357,7 @@ class OpenAICompatibleProvider(BaseLLMProvider):
                 content = getattr(response, "output_text", "") or ""
                 usage_obj = getattr(response, "usage", None)
                 tool_calls = None
+                reasoning = self._extract_responses_reasoning(response)
             else:
                 response = await client.chat.completions.create(**api_kwargs)
                 choice = response.choices[0]
@@ -301,6 +365,10 @@ class OpenAICompatibleProvider(BaseLLMProvider):
                 content = message.content or ""
                 tool_calls = self._extract_tool_calls(message.tool_calls)
                 usage_obj = response.usage
+                reasoning = (
+                    getattr(message, "reasoning", None)
+                    or getattr(message, "reasoning_content", None)
+                )
 
             # Use base class helpers for extraction
             usage = self._extract_usage(usage_obj)
@@ -311,7 +379,8 @@ class OpenAICompatibleProvider(BaseLLMProvider):
                 content=content,
                 usage=usage,
                 latency_ms=self._measure_latency(start_time),
-                tool_calls=tool_calls
+                tool_calls=tool_calls,
+                reasoning=reasoning,
             )
 
         except Exception as e:
@@ -396,6 +465,14 @@ class OpenAICompatibleProvider(BaseLLMProvider):
                         delta = getattr(event, "delta", "")
                         if delta:
                             yield LLMStreamChunk(content=delta)
+                    elif event_type == "response.reasoning_text.delta":
+                        delta = getattr(event, "delta", "")
+                        if delta:
+                            yield LLMStreamChunk(
+                                content="",
+                                reasoning=delta,
+                                is_reasoning=True,
+                            )
                 return
             stream = await client.chat.completions.create(**api_kwargs)
 
@@ -414,6 +491,9 @@ class OpenAICompatibleProvider(BaseLLMProvider):
                 # Check if this chunk has reasoning content
                 if hasattr(delta, 'reasoning') and delta.reasoning:
                     reasoning_content = delta.reasoning
+                    is_reasoning = True
+                elif hasattr(delta, 'reasoning_content') and delta.reasoning_content:
+                    reasoning_content = delta.reasoning_content
                     is_reasoning = True
 
                 # Extract regular output content

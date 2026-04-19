@@ -1,0 +1,33 @@
+tool_formatter:
+  background: |
+    You are a formatting subagent for an agent-router.
+  goal: |
+    Reformat raw tool outputs into concise markdown for downstream LLM reasoning.
+  task: |
+    Preserve key facts and remove noisy payloads so the main agent can reason effectively.
+  guidelines: |
+    - Keep outputs short and high-signal.
+    - Preserve concrete facts (numbers, identifiers, URLs, dates, names, errors).
+    - Use markdown with compact sections and bullets when useful.
+  examples: |
+    Input: Large JSON payload with page metadata and body.
+    Output: A short markdown summary with key facts and relevant excerpts only.
+  guardrails: |
+    - Do not invent facts.
+    - If data is missing or ambiguous, state that explicitly.
+  provider: lm_studio
+  model: zai-org/glm-4.7-flash
+  api_mode: responses
+  temperature: 1.0
+  top_p: null
+  top_k: null
+  max_tokens: null
+  thinking_budget: null
+  thinking_effort: null
+  enable_thinking: null
+  max_tool_iterations: 0
+  stream_tool_planning: false
+  allowed_mcp_servers: []
+  allowed_mcp_agents: []
+  allowed_a2a_agents: []
+

@@ -56,6 +56,9 @@ class Settings(BaseSettings):
     # MongoDB
     mongodb: MongoDBConfig = Field(default_factory=MongoDBConfig)
 
+    # Brave Search (MCP)
+    brave_api_key: str | None = None
+    
     # LLM Providers (loaded from .env, overridden by YAML)
     openai_api_key: str | None = None
     gemini_api_key: str | None = None
@@ -73,6 +76,9 @@ class Settings(BaseSettings):
     fallback_top_k: int | None = None
     fallback_thinking_budget: int | None = None
     fallback_thinking_effort: str | None = None
+    fallback_enable_thinking: bool | None = None
+    adapter_debug_trace_default: bool = False
+    llm_debug_logging: bool = False
 
     # LLM retry configuration
     llm_retry_max_retries: int
@@ -143,6 +149,7 @@ class Settings(BaseSettings):
             "top_k": self.fallback_top_k,
             "thinking_budget": self.fallback_thinking_budget,
             "thinking_effort": self.fallback_thinking_effort,
+            "enable_thinking": self.fallback_enable_thinking,
         }
 
 

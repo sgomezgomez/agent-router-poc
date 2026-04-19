@@ -1,0 +1,266 @@
+---
+description: Python coding patterns and best practices for Agent Router
+globs: src/**/*.py
+alwaysApply: true
+---
+
+# Python Patterns & Best Practices
+
+## Configuration Management
+
+### ✅ DO: Keep Secrets in .env
+```python
+# .env (NOT in git)
+OPENAI_API_KEY=sk-proj-abc123...
+
+# config.py (in git)
+class Settings(BaseSettings):
+    openai_api_key: str | None = None
+    model_config = SettingsConfigDict(env_file=".env")
+```
+
+### ❌ DON'T: Hardcode Secrets
+```python
+# NEVER do this!
+OPENAI_API_KEY = "sk-proj-abc123..."  # Committed to git = security risk
+```
+
+**Rule**: All secrets (API keys, passwords, tokens) MUST be in `.env`. Code only defines the field structure.
+
+---
+
+## Async/Await Patterns
+
+### ✅ DO: Use async for I/O operations
+```python
+# Good - async for database, HTTP, LLM calls
+async def save_llm_call(self, data: Dict) -> str:
+    result = await self.collection.insert_one(data)
+    return str(result.inserted_id)
+```
+
+### ❌ DON'T: Use sync for I/O
+```python
+# Bad - blocks event loop
+def save_llm_call(self, data: Dict) -> str:
+    result = self.collection.insert_one(data)  # Blocking!
+    return str(result.inserted_id)
+```
+
+**Rule**: Use `async`/`await` for:
+- Database operations (MongoDB with Motor)
+- HTTP requests (httpx)
+- LLM API calls
+- File I/O (aiofiles)
+
+---
+
+## Retry Logic
+
+### WHEN to Use @async_retry
+
+✅ **USE for external services:**
+- LLM API calls (OpenAI, Gemini, Grok)
+- HTTP requests to remote agents (A2A)
+- Database connections during startup
+- MCP server connections
+
+```python
+@async_retry(max_attempts=3, delay=1.0, exceptions=(httpx.HTTPError,))
+async def call_openai(self, prompt: str) -> str:
+    response = await self.client.chat.completions.create(...)
+    return response.choices[0].message.content
+```
+
+❌ **DON'T USE for:**
+- Pure Python logic (no network/IO)
+- Database queries (let MongoDB driver handle it)
+- User input validation
+- File system operations (fail fast instead)
+
+**Rule**: Only retry operations that can fail due to temporary issues (network, rate limits, service unavailability).
+
+---
+
+## Error Handling
+
+### ✅ DO: Use custom exceptions
+```python
+from agent_router.core.errors import LLMProviderError, ToolExecutionError
+
+async def execute_tool(self, name: str, params: Dict) -> Dict:
+    try:
+        result = await self.mcp_client.call_tool(name, params)
+        return result
+    except Exception as e:
+        raise ToolExecutionError(name, str(e))  # Specific error type
+```
+
+### ❌ DON'T: Catch and silence errors
+```python
+try:
+    result = await self.mcp_client.call_tool(name, params)
+    return result
+except Exception:
+    return {}  # BAD - error is lost!
+```
+
+**Rule**: Always raise meaningful exceptions. Let the Agent Layer decide how to handle them.
+
+---
+
+## Type Hints
+
+### ✅ DO: Use type hints everywhere
+```python
+from typing import Dict, List, Any
+
+async def execute(self, tool_name: str, parameters: Dict[str, Any]) -> Dict:
+    """Execute tool with proper types."""
+    results: List[str] = []
+    return {"results": results}
+```
+
+### ❌ DON'T: Skip type hints
+```python
+async def execute(tool_name, parameters):  # No types = hard to maintain
+    results = []
+    return {"results": results}
+```
+
+**Rule**: All function signatures must have type hints. Use `Dict`, `List`, `Any` from `typing`.
+
+---
+
+## Pydantic Models
+
+### ✅ DO: Use Pydantic for data validation
+```python
+from pydantic import BaseModel, Field
+
+class LLMCall(BaseModel):
+    session_id: str
+    provider: str
+    prompt: str
+    response: str
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+```
+
+### ❌ DON'T: Use plain dictionaries for structured data
+```python
+# Bad - no validation
+llm_call = {
+    "session_id": session_id,
+    "provider": provider,
+    # Easy to forget fields, misspell keys, wrong types
+}
+```
+
+**Rule**: All data models (configs, database documents, API requests/responses) MUST use Pydantic.
+
+---
+
+## Dependency Injection
+
+### ✅ DO: Pass dependencies via constructor
+```python
+class Agent:
+    def __init__(
+        self,
+        llm_service: LLMService,
+        storage: LLMCallRepository,
+        orchestrator: Orchestrator
+    ):
+        self.llm = llm_service
+        self.storage = storage
+        self.orchestrator = orchestrator
+```
+
+### ❌ DON'T: Create dependencies inside class
+```python
+class Agent:
+    def __init__(self):
+        self.llm = LLMService()  # Hard to test, hard to swap
+        self.storage = LLMCallRepository()
+```
+
+**Rule**: Components receive dependencies via constructor. This makes testing and swapping implementations easy.
+
+---
+
+## Logging
+
+### ✅ DO: Use structured logging
+```python
+from agent_router.utils.logging import StructuredLogger
+
+logger = StructuredLogger(__name__, settings)
+logger.info("Tool executed", tool_name=tool_name, duration_ms=duration)
+```
+
+### ❌ DON'T: Use print() or basic logging
+```python
+print(f"Tool {tool_name} took {duration}ms")  # Lost in production
+logging.info(f"Tool {tool_name}")  # Unstructured
+```
+
+**Rule**: Always use `StructuredLogger` with key-value pairs for searchability.
+
+---
+
+## File Paths
+
+### ✅ DO: Use Path objects
+```python
+from pathlib import Path
+
+config_path = Path("config") / "agents" / "router.yaml"
+if config_path.exists():
+    with open(config_path) as f:
+        data = yaml.safe_load(f)
+```
+
+### ❌ DON'T: Use string concatenation
+```python
+config_path = "config/agents/router.yaml"  # Windows issues
+```
+
+**Rule**: Use `pathlib.Path` for all file operations. It's cross-platform and safer.
+
+---
+
+## Context Managers
+
+### ✅ DO: Use async context managers for resources
+```python
+async with httpx.AsyncClient() as client:
+    response = await client.get(url)
+
+async with aiofiles.open(file_path) as f:
+    content = await f.read()
+```
+
+### ❌ DON'T: Forget to close resources
+```python
+client = httpx.AsyncClient()
+response = await client.get(url)  # Never closed!
+```
+
+**Rule**: Always use `async with` for HTTP clients, file handles, database connections.
+
+---
+
+## Summary: Quick Decision Guide
+
+| Scenario | Pattern to Use |
+|----------|---------------|
+| Store API key | `.env` file + Pydantic Settings |
+| Database operation | `async def` with Motor |
+| HTTP request | `async def` with httpx |
+| LLM API call | `async def` + `@async_retry` |
+| Data model | Pydantic `BaseModel` |
+| Error handling | Custom exception from `core.errors` |
+| Logging | `StructuredLogger` with key-value pairs |
+| Pass dependencies | Constructor injection |
+| File path | `pathlib.Path` |
+| External resource | `async with` context manager |

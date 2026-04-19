@@ -1,0 +1,2539 @@
+---
+description: Implementation plan for Agent Router POC - Single agent with MCP/A2A tool routing
+alwaysApply: false
+---
+
+# Agent Router POC - Implementation Plan
+
+## Project Overview
+
+Build a proof of concept for an autonomous agent that:
+- Receives user queries and routes to available tools/agents
+- Uses any LLM provider (OpenAI, Gemini, LM Studio, Grok)
+- Manages persona/role via YAML-based system prompts
+- Connects to MCP tools, MCP agents, and A2A agents
+- Makes autonomous routing decisions using LLM
+- Stores every LLM call in MongoDB for audit trails
+- Self-heals from failures using LLM analysis
+
+**Key Design**: ONE main agent that does routing and orchestration (not multiple agents)
+
+**Stack**:
+- Language: Python
+- Package Manager: Poetry
+- Database: MongoDB (local community server)
+- Environment: Local development with LM Studio support (no Docker dependency)
+
+> **📖 Architecture Reference**: For detailed architecture diagrams, component responsibilities, design principles, and technology decisions, see [architecture.mdc](.cursor/rules/architecture.mdc).
+>
+> **This plan focuses on**: What to build, implementation order, verification steps, and success criteria.
+> **The architecture doc explains**: Why decisions were made, how components interact, and design patterns to follow.
+
+## Quick Component Summary
+
+> **📖 Full Details**: See [architecture.mdc - Component Responsibilities](.cursor/rules/architecture.mdc#component-responsibilities) for complete descriptions and interaction diagrams.
+
+**Core Components**:
+1. **Main Script** - Dumb I/O glue (receives input, yields output)
+2. **Agent Layer** - THE smart orchestrator (all intelligence lives here)
+3. **LLM Service** - Multi-provider LLM access (OpenAI, Gemini, LM Studio, Grok)
+4. **Orchestrator** - Dumb executor (runs tools, logs execution)
+5. **Storage Layer** - MongoDB persistence (llm_calls, tool_executions, conversations)
+6. **Connectors** - MCP and A2A protocol communication
+
+**Key Principle**: Agent Layer makes ALL decisions. Everything else is dumb infrastructure.
+
+## Dependencies (Poetry)
+
+> **📖 Technology Stack**: See [architecture.mdc - Technology Stack](.cursor/rules/architecture.mdc#technology-stack) for rationale on each technology choice.
+
+```toml
+[tool.poetry]
+name = "agent-router"
+version = "0.1.0"
+description = "Autonomous agent with MCP and A2A routing"
+python = "^3.10"
+
+[tool.poetry.dependencies]
+# LLM Providers
+openai = "^1.12.0"
+google-genai = "^0.3.0"
+
+# MCP Support
+mcp = "^0.9.0"
+
+# A2A Support
+httpx = "^0.26.0"
+websockets = "^12.0"
+
+# Database
+motor = "^3.3.2"              # Async MongoDB
+pymongo = "^4.6.1"            # Sync MongoDB
+
+# API adapter
+fastapi = "^0.116.0"
+uvicorn = "^0.35.0"
+
+# Core
+pydantic = "^2.5.0"
+pydantic-settings = "^2.1.0"
+python-dotenv = "^1.0.0"
+pyyaml = "^6.0.1"
+aiofiles = "^23.2.1"
+tenacity = "^8.2.3"
+
+[tool.poetry.group.dev.dependencies]
+black = "^23.12.0"
+ruff = "^0.1.9"
+mypy = "^1.8.0"
+pre-commit = "^3.5.0"
+```
+
+## Project Structure
+
+```
+agent-router-poc/
+├── src/
+│   └── agent_router/
+│       ├── __init__.py
+│       ├── main.py                    # CLI entry point
+│       │
+│       ├── core/                      # Core abstractions & interfaces
+│       │   ├── __init__.py
+│       │   ├── interfaces.py         # Protocols/ABCs for connectors
+│       │   ├── events.py             # Event models for streaming
+│       │   ├── errors.py             # Custom exceptions
+│       │   └── config.py             # Config management (Pydantic Settings)
+│       │
+│       ├── agent/                     # Agent Layer (reusable)
+│       │   ├── __init__.py
+│       │   ├── base.py               # Base Agent class
+│       │   ├── models.py             # AgentConfig, Message, Context
+│       │   └── prompt_builder.py     # System prompt construction
+│       │
+│       ├── llm/                       # LLM Service Layer
+│       │   ├── __init__.py
+│       │   ├── service.py            # LLMService (multi-provider)
+│       │   ├── providers/            # Provider implementations
+│       │   │   ├── __init__.py
+│       │   │   ├── base.py           # BaseLLMProvider (ABC)
+│       │   │   ├── openai_compatible.py
+│       │   │   ├── gemini.py
+│       │   │   ├── lm_studio.py
+│       │   │   └── grok.py
+│       │   ├── model_registry.py     # Model capabilities & costs
+│       │   └── models.py             # LLMRequest, LLMResponse
+│       │
+│       ├── storage/                   # Data persistence
+│       │   ├── __init__.py
+│       │   ├── connection.py         # MongoDB connection manager
+│       │   ├── models.py             # LLMCall, ToolExecution, Conversation
+│       │   ├── base_repository.py    # Abstract base repository
+│       │   └── repositories/
+│       │       ├── __init__.py
+│       │       ├── llm_calls.py
+│       │       ├── tool_executions.py
+│       │       └── conversations.py
+│       │
+│       ├── orchestrator/              # Execution engine
+│       │   ├── __init__.py
+│       │   ├── orchestrator.py       # Main orchestrator
+│       │   └── models.py             # RoutingDecision, ExecutionResult
+│       │
+│       ├── connectors/                # Protocol connectors
+│       │   ├── __init__.py
+│       │   ├── mcp/
+│       │   │   ├── __init__.py
+│       │   │   ├── client.py         # MCP client implementation
+│       │   │   ├── registry.py       # Tool/agent discovery
+│       │   │   └── models.py         # MCP-specific models
+│       │   └── a2a/
+│       │       ├── __init__.py
+│       │       ├── client.py         # A2A client implementation
+│       │       └── models.py         # A2A-specific models
+│       │
+│       ├── router/                    # Main routing agent
+│       │   ├── __init__.py
+│       │   ├── agent.py              # RouterAgent (uses Agent base)
+│       │   └── prompts.py            # Router-specific prompts
+│       │
+│       ├── ui/                        # User interfaces
+│       │   ├── __init__.py
+│       │   ├── openai_adapter.py     # OpenAI-compatible adapter API
+│       │   └── ...                   # external UI handled outside repo
+│       │       ├── __init__.py
+│       │       ├── chat.py
+│       │       └── debug_panel.py
+│       │
+│       └── utils/                     # Utilities
+│           ├── __init__.py
+│           ├── logging.py            # Structured logging
+│           ├── retry.py              # Retry decorators
+│           └── validation.py         # Input validation
+│
+├── config/
+│   ├── agents/                       # Agent persona configs
+│   │   ├── router.yaml              # Main routing agent
+│   │   ├── summarizer.yaml          # Example MCP agent
+│   │   └── researcher.yaml          # Example MCP agent
+│   ├── llm_models.yaml              # Model registry (capabilities/costs)
+│   ├── mcp_servers.yaml             # MCP server list
+│   └── settings.yaml                # Global settings
+│
+├── examples/                         # Usage examples
+│   ├── basic_query.py
+│   ├── streaming_example.py
+│   ├── custom_agent.py
+│   └── multi_step_workflow.py
+│
+├── tests/                           # Manual test scripts
+│   └── manual/
+│       ├── test_mcp_servers.py
+│       ├── test_agent_base.py
+│       ├── test_provider_smoke.py
+│       └── test_openai_compatible_modes.py
+│
+├── docs/                            # Documentation
+├── .env.example
+├── .gitignore
+├── pyproject.toml                   # Poetry config
+├── poetry.lock
+└── README.md
+```
+
+## Architecture Principles
+
+> **📖 Core Principles**: See [architecture.mdc - Core Principles](.cursor/rules/architecture.mdc#core-principles).
+>
+> This plan avoids duplicating architectural details. Follow the architecture document for all design rules.
+
+## Implementation Phases
+
+---
+
+### PHASE 0: Project Setup & Core Abstractions ✅ **COMPLETED**
+
+**Goal**: Initialize project, create core module with interfaces/events/errors
+
+**Status**: ✅ All tasks completed, verification passed
+
+**Tasks**:
+1. Initialize Poetry project
+   ```bash
+   poetry init
+   poetry add openai google-genai httpx motor pymongo pydantic pydantic-settings python-dotenv pyyaml aiofiles tenacity fastapi uvicorn mcp a2a-sdk
+   poetry add --group dev black ruff mypy pre-commit
+   ```
+
+   **Note on MCP and A2A SDKs:**
+   - `mcp`: Official Python SDK for Model Context Protocol - https://github.com/modelcontextprotocol/python-sdk
+   - `a2a-sdk`: Official Python SDK for Agent-to-Agent Protocol - https://github.com/a2aproject/a2a-python
+
+2. Create project structure (all directories from structure above)
+
+3. Set up local MongoDB (Community Server)
+   - Install MongoDB locally and start the service
+   - Configure `.env` with `MONGODB__URI` and `MONGODB__DATABASE`
+   - See [architecture.mdc - Storage Strategy](.cursor/rules/architecture.mdc#storage-strategy) for local connection requirements
+
+4. Create `core/` module with abstractions:
+   ```python
+   # core/interfaces.py
+   from abc import ABC, abstractmethod
+   from typing import AsyncIterator, Dict, Any
+
+   class LLMProvider(ABC):
+       """Abstract base for all LLM providers."""
+       @abstractmethod
+       async def generate(self, prompt: str, **kwargs) -> str: ...
+
+       @abstractmethod
+       async def generate_stream(self, prompt: str, **kwargs) -> AsyncIterator[str]: ...
+
+   class ToolConnector(ABC):
+       """Abstract base for tool connectors (MCP, A2A)."""
+       @abstractmethod
+       async def connect(self, config: Dict) -> None: ...
+
+       @abstractmethod
+       async def execute(self, tool_name: str, parameters: Dict) -> Dict: ...
+
+       @abstractmethod
+       async def list_tools(self) -> list: ...
+
+   class Repository(ABC):
+       """Abstract base repository."""
+       @abstractmethod
+       async def create(self, data: Dict) -> str: ...
+
+       @abstractmethod
+       async def find_by_id(self, id: str) -> Dict | None: ...
+   ```
+
+   ```python
+   # core/events.py
+   from pydantic import BaseModel, Field
+   from datetime import datetime
+   from typing import Literal, Any
+
+   class AgentEvent(BaseModel):
+       """Base event for agent streaming."""
+       timestamp: datetime = Field(default_factory=datetime.utcnow)
+
+   class ThinkingEvent(AgentEvent):
+       type: Literal["thinking"] = "thinking"
+       content: str
+
+   class ToolCallEvent(AgentEvent):
+       type: Literal["tool_call"] = "tool_call"
+       tool_name: str
+       parameters: Dict[str, Any]
+
+   class ToolResultEvent(AgentEvent):
+       type: Literal["tool_result"] = "tool_result"
+       tool_name: str
+       result: Any
+       error: str | None = None
+
+   class ResponseEvent(AgentEvent):
+       type: Literal["response"] = "response"
+       content: str
+   ```
+
+   ```python
+   # core/errors.py
+   class AgentRouterError(Exception):
+       """Base exception for all agent router errors."""
+       pass
+
+   class LLMProviderError(AgentRouterError):
+       """LLM provider specific errors."""
+       pass
+
+   class ToolExecutionError(AgentRouterError):
+       """Tool execution errors."""
+       def __init__(self, tool_name: str, message: str):
+           self.tool_name = tool_name
+           super().__init__(f"Tool '{tool_name}' failed: {message}")
+
+   class ConfigurationError(AgentRouterError):
+       """Configuration errors."""
+       pass
+   ```
+
+   ```python
+   # core/config.py
+   from pydantic import BaseModel, Field
+   from pydantic_settings import BaseSettings, SettingsConfigDict
+   from typing import Dict, Any
+   import yaml
+   from pathlib import Path
+
+   class LLMProviderConfig(BaseModel):
+       """Configuration for a single LLM provider."""
+       enabled: bool = True
+       api_key: str | None = None
+       base_url: str | None = None
+       default_model: str
+       temperature: float = 0.7
+       max_tokens: int | None = None
+       timeout: int = 30
+
+   class MongoDBConfig(BaseModel):
+       """MongoDB configuration."""
+       uri: str = "mongodb://admin:password@localhost:27017"
+       database: str = "agent_router"
+       max_pool_size: int = 10
+       min_pool_size: int = 1
+
+   class LoggingConfig(BaseModel):
+       """Logging configuration."""
+       level: str = "INFO"
+       format: str = "json"
+       file: str | None = None
+
+  class Settings(BaseSettings):
+      """Global settings loaded from .env."""
+
+      # MongoDB
+      mongodb: MongoDBConfig = Field(default_factory=MongoDBConfig)
+
+      # LLM Providers (keys are optional; fallback to LM Studio)
+      openai_api_key: str | None = None
+      gemini_api_key: str | None = None
+      grok_api_key: str | None = None
+      lm_studio_base_url: str
+
+      # Fallback provider/model
+      fallback_llm_provider: str = "lm_studio"
+      fallback_llm_model: str = "zai-org/glm-4.7-flash"
+
+      # Logging
+      logging: LoggingConfig = Field(default_factory=LoggingConfig)
+
+      model_config = SettingsConfigDict(
+          env_file=".env",
+          env_file_encoding="utf-8",
+          env_nested_delimiter="__"
+      )
+
+      def get_model_registry(self) -> LLMModelRegistry:
+          """Load model capabilities from config/llm_models.yaml."""
+          return load_model_registry()
+           return providers
+
+   class AgentConfig(BaseModel):
+       """Configuration for an agent persona loaded from YAML."""
+       name: str
+       background: str
+       goal: str
+       task: str | None = None
+       guidelines: str | None = None
+       examples: str | None = None
+       guardrails: str | None = None
+       message_window: str = "LAST_10_TURNS"
+       max_context_tokens: int = 4000
+
+       @classmethod
+       def from_yaml(cls, yaml_path: str) -> "AgentConfig":
+           """Load agent config from YAML file."""
+           with open(yaml_path) as f:
+               data = yaml.safe_load(f)
+               # Assumes YAML has a single top-level key (agent name)
+               agent_name = list(data.keys())[0]
+               config = data[agent_name]
+               config["name"] = agent_name
+               return cls(**config)
+   ```
+
+5. Create `utils/` module with cross-cutting utilities:
+   ```python
+   # utils/logging.py
+   import logging
+   import json
+   from datetime import datetime
+   from typing import Any, Dict
+   from agent_router.core.config import Settings
+
+   class StructuredLogger:
+       """Structured JSON logger for the agent router."""
+
+       def __init__(self, name: str, settings: Settings):
+           self.logger = logging.getLogger(name)
+           self.settings = settings
+
+           # Configure based on settings
+           level = getattr(logging, settings.logging.level.upper())
+           self.logger.setLevel(level)
+
+           # Create handler
+           if settings.logging.file:
+               handler = logging.FileHandler(settings.logging.file)
+           else:
+               handler = logging.StreamHandler()
+
+           # Format as JSON if configured
+           if settings.logging.format == "json":
+               handler.setFormatter(JSONFormatter())
+           else:
+               handler.setFormatter(
+                   logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+               )
+
+           self.logger.addHandler(handler)
+
+       def info(self, message: str, **kwargs):
+           self._log(logging.INFO, message, kwargs)
+
+       def error(self, message: str, **kwargs):
+           self._log(logging.ERROR, message, kwargs)
+
+       def warning(self, message: str, **kwargs):
+           self._log(logging.WARNING, message, kwargs)
+
+       def debug(self, message: str, **kwargs):
+           self._log(logging.DEBUG, message, kwargs)
+
+       def _log(self, level: int, message: str, extra: Dict[str, Any]):
+           self.logger.log(level, message, extra={"structured_data": extra})
+
+   class JSONFormatter(logging.Formatter):
+       """Format log records as JSON."""
+
+       def format(self, record: logging.LogRecord) -> str:
+           log_data = {
+               "timestamp": datetime.utcnow().isoformat(),
+               "level": record.levelname,
+               "logger": record.name,
+               "message": record.getMessage(),
+           }
+
+           # Add structured data if present
+           if hasattr(record, "structured_data"):
+               log_data.update(record.structured_data)
+
+           # Add exception info if present
+           if record.exc_info:
+               log_data["exception"] = self.formatException(record.exc_info)
+
+           return json.dumps(log_data)
+   ```
+
+   ```python
+   # utils/retry.py
+   import asyncio
+   from functools import wraps
+   from typing import TypeVar, Callable, Any
+   from agent_router.utils.logging import StructuredLogger
+
+   T = TypeVar('T')
+
+   def async_retry(
+       max_attempts: int = 3,
+       delay: float = 1.0,
+       backoff: float = 2.0,
+       exceptions: tuple = (Exception,)
+   ):
+       """Decorator for async retry with exponential backoff.
+
+       Args:
+           max_attempts: Maximum number of retry attempts
+           delay: Initial delay between retries (seconds)
+           backoff: Multiplier for delay after each retry
+           exceptions: Tuple of exceptions to catch and retry
+       """
+       def decorator(func: Callable[..., T]) -> Callable[..., T]:
+           @wraps(func)
+           async def wrapper(*args, **kwargs) -> T:
+               current_delay = delay
+               last_exception = None
+
+               for attempt in range(1, max_attempts + 1):
+                   try:
+                       return await func(*args, **kwargs)
+                   except exceptions as e:
+                       last_exception = e
+
+                       if attempt == max_attempts:
+                           raise
+
+                       # Log retry attempt
+                       logger = kwargs.get('logger')
+                       if logger:
+                           logger.warning(
+                               f"Attempt {attempt}/{max_attempts} failed, retrying in {current_delay}s",
+                               function=func.__name__,
+                               error=str(e)
+                           )
+
+                       await asyncio.sleep(current_delay)
+                       current_delay *= backoff
+
+               raise last_exception
+
+           return wrapper
+       return decorator
+   ```
+
+   ```python
+   # utils/validation.py
+   from typing import Dict, Any, List
+   from pydantic import BaseModel, ValidationError
+   from agent_router.core.errors import ConfigurationError
+
+   class InputValidator:
+       """Validates inputs against schemas and business rules."""
+
+       @staticmethod
+       def validate_model(data: Dict[str, Any], model_class: type[BaseModel]) -> BaseModel:
+           """Validate data against a Pydantic model.
+
+           Args:
+               data: Dictionary to validate
+               model_class: Pydantic model class
+
+           Returns:
+               Validated model instance
+
+           Raises:
+               ConfigurationError: If validation fails
+           """
+           try:
+               return model_class(**data)
+           except ValidationError as e:
+               raise ConfigurationError(f"Validation failed: {e}")
+
+       @staticmethod
+       def validate_tool_parameters(
+           parameters: Dict[str, Any],
+           required_params: List[str],
+           optional_params: List[str] | None = None
+       ) -> None:
+           """Validate tool parameters.
+
+           Args:
+               parameters: Parameters to validate
+               required_params: List of required parameter names
+               optional_params: List of optional parameter names
+
+           Raises:
+               ValueError: If required parameters are missing or unknown parameters present
+           """
+           # Check required parameters
+           missing = set(required_params) - set(parameters.keys())
+           if missing:
+               raise ValueError(f"Missing required parameters: {missing}")
+
+           # Check for unknown parameters
+           if optional_params is not None:
+               allowed = set(required_params) | set(optional_params)
+               unknown = set(parameters.keys()) - allowed
+               if unknown:
+                   raise ValueError(f"Unknown parameters: {unknown}")
+
+       @staticmethod
+       def sanitize_file_path(path: str) -> str:
+           """Sanitize file path to prevent directory traversal attacks.
+
+           Args:
+               path: File path to sanitize
+
+           Returns:
+               Sanitized path
+
+           Raises:
+               ValueError: If path contains suspicious patterns
+           """
+           # Check for directory traversal attempts
+           if ".." in path or path.startswith("/"):
+               raise ValueError(f"Suspicious file path: {path}")
+
+           return path.strip()
+   ```
+
+6. Create configuration files
+   - `.env.example`
+   - `config/settings.yaml` (global settings)
+   - `config/agents/router.yaml` (main agent config)
+   - `.gitignore`
+
+7. Set up dev tools
+   ```bash
+   # pyproject.toml
+   [tool.black]
+   line-length = 100
+   target-version = ['py310']
+
+   [tool.ruff]
+   line-length = 100
+   target-version = "py310"
+
+   [tool.mypy]
+   python_version = "3.10"
+   strict = true
+   ```
+
+**Deliverables**:
+- Working Poetry environment
+- MongoDB running
+- Complete project structure
+- Core abstractions (interfaces, events, errors, config)
+- Utility modules (logging, retry, validation)
+- Dev tools configured
+
+**Verification**:
+```bash
+poetry install
+poetry run black src/ --check
+poetry run ruff check src/
+poetry run mypy src/
+mongosh "mongodb://localhost:27017" --eval "db.version()"
+
+# Verify core module imports
+poetry run python -c "
+from agent_router.core.events import ThinkingEvent
+from agent_router.core.interfaces import LLMProvider
+from agent_router.core.errors import AgentRouterError
+from agent_router.core.config import Settings, AgentConfig
+from agent_router.utils.logging import StructuredLogger
+from agent_router.utils.retry import async_retry
+from agent_router.utils.validation import InputValidator
+print('Core abstractions and utilities working!')
+"
+```
+
+---
+
+### PHASE 1: MongoDB Storage Layer
+
+**Goal**: Build storage layer with separate collections for LLM calls and tool executions
+
+**Tasks**:
+1. Create storage models
+   ```python
+   # src/agent_router/storage/models.py
+
+   # Stored by Agent Layer
+   class LLMCall(BaseModel):
+       uuid: str
+       session_id: Optional[str]
+       system_prompt: str
+       user_prompt: str
+       provider: str
+       model: str
+       response: str
+       usage: Dict[str, int]  # tokens, etc.
+       latency_ms: float
+       timestamp: datetime
+       error: Optional[str]
+       streaming: bool  # whether this was a streaming call
+
+   # Stored by Orchestrator
+   class ToolExecution(BaseModel):
+       uuid: str
+       session_id: Optional[str]
+       tool_name: str
+       tool_type: Literal["mcp_tool", "mcp_agent", "a2a_agent"]
+       parameters: Dict[str, Any]
+       result: Optional[Dict]
+       error: Optional[str]
+       latency_ms: float
+       timestamp: datetime
+
+   class Session(BaseModel):
+       uuid: str
+       message_history: List[Dict]
+       created_at: datetime
+       last_updated: datetime
+   ```
+
+2. Implement MongoDB connection manager
+   ```python
+   # storage/connection.py
+   from motor.motor_asyncio import AsyncIOMotorClient
+   from agent_router.core.config import Settings
+
+   class MongoDBConnection:
+       """Singleton MongoDB connection manager."""
+       _instance = None
+       _client: AsyncIOMotorClient | None = None
+
+       def __new__(cls):
+           if cls._instance is None:
+               cls._instance = super().__new__(cls)
+           return cls._instance
+
+       async def connect(self, settings: Settings):
+           if self._client is None:
+               self._client = AsyncIOMotorClient(settings.mongodb_uri)
+           return self._client[settings.mongodb_database]
+
+       async def disconnect(self):
+           if self._client:
+               self._client.close()
+               self._client = None
+   ```
+
+3. Create abstract base repository (implements core interface)
+   ```python
+   # storage/base_repository.py
+   from abc import ABC
+   from motor.motor_asyncio import AsyncIOMotorCollection
+   from agent_router.core.interfaces import Repository
+   from typing import Dict, List
+   import uuid as uuid_lib
+
+   class BaseRepository(Repository):
+       """Abstract base repository with common CRUD operations."""
+
+       def __init__(self, collection: AsyncIOMotorCollection):
+           self.collection = collection
+
+       async def create(self, data: Dict) -> str:
+           """Create document with auto-generated UUID."""
+           if "uuid" not in data:
+               data["uuid"] = str(uuid_lib.uuid4())
+           await self.collection.insert_one(data)
+           return data["uuid"]
+
+       async def find_by_id(self, uuid: str) -> Dict | None:
+           """Find document by UUID."""
+           return await self.collection.find_one({"uuid": uuid})
+
+       async def find_many(self, filter: Dict, limit: int = 100) -> List[Dict]:
+           """Find multiple documents."""
+           cursor = self.collection.find(filter).limit(limit)
+           return await cursor.to_list(length=limit)
+
+       async def update(self, uuid: str, data: Dict) -> bool:
+           """Update document by UUID."""
+           result = await self.collection.update_one(
+               {"uuid": uuid},
+               {"$set": data}
+           )
+           return result.modified_count > 0
+   ```
+
+4. Create specific repositories
+   ```python
+   # storage/repositories/llm_calls.py
+   from agent_router.storage.base_repository import BaseRepository
+   from typing import List, Dict
+
+   class LLMCallRepository(BaseRepository):
+       """Repository for LLM call logs."""
+
+       async def save_llm_call(self, call_data: Dict) -> str:
+           """Save an LLM call log."""
+           return await self.create(call_data)
+
+       async def get_by_session(self, session_id: str, limit: int = 100) -> List[Dict]:
+           """Get all LLM calls for a session."""
+           return await self.find_many({"session_id": session_id}, limit=limit)
+
+       async def get_by_provider(self, provider: str, limit: int = 100) -> List[Dict]:
+           """Get LLM calls by provider."""
+           return await self.find_many({"provider": provider}, limit=limit)
+
+   # storage/repositories/tool_executions.py
+   class ToolExecutionRepository(BaseRepository):
+       """Repository for tool execution logs."""
+
+       async def save_execution(self, execution_data: Dict) -> str:
+           """Save a tool execution log."""
+           return await self.create(execution_data)
+
+       async def get_by_session(self, session_id: str, limit: int = 100) -> List[Dict]:
+           """Get all tool executions for a session."""
+           return await self.find_many({"session_id": session_id}, limit=limit)
+
+       async def get_by_tool(self, tool_name: str, limit: int = 100) -> List[Dict]:
+           """Get executions by tool name."""
+           return await self.find_many({"tool_name": tool_name}, limit=limit)
+
+   # storage/repositories/conversations.py
+   class ConversationRepository(BaseRepository):
+       """Repository for conversations."""
+
+       async def create_conversation(self, conversation_data: Dict) -> str:
+           """Create a new conversation."""
+           return await self.create(conversation_data)
+
+       async def get_conversation(self, conversation_id: str) -> Dict | None:
+           """Get conversation by ID."""
+           return await self.find_by_id(conversation_id)
+
+       async def update_history(self, conversation_id: str, message: Dict) -> bool:
+           """Append message to conversation history."""
+           result = await self.collection.update_one(
+               {"uuid": conversation_id},
+               {
+                   "$push": {"message_history": message},
+                   "$set": {"last_updated": datetime.utcnow()}
+               }
+           )
+           return result.modified_count > 0
+   ```
+
+**Deliverables**:
+- MongoDB storage layer complete with connection manager
+- Abstract base repository implementing core interface
+- Three specific repositories (llm_calls, tool_executions, conversations)
+- Separate collections for clear data separation
+
+**Verification**:
+```bash
+# Test storage layer
+poetry run python -c "
+import asyncio
+from agent_router.core.config import Settings
+from agent_router.storage.connection import MongoDBConnection
+from agent_router.storage.repositories.llm_calls import LLMCallRepository
+
+async def test():
+    settings = Settings()
+    conn = MongoDBConnection()
+    db = await conn.connect(settings)
+    repo = LLMCallRepository(db['llm_calls'])
+    uuid = await repo.save_llm_call({'test': 'data', 'provider': 'test'})
+    print(f'Saved with UUID: {uuid}')
+    doc = await repo.find_by_id(uuid)
+    print(f'Retrieved: {doc}')
+
+asyncio.run(test())
+"
+
+# Check MongoDB directly
+mongosh "mongodb://localhost:27017"
+use agent_router
+db.llm_calls.find()
+db.tool_executions.find()
+db.conversations.find()
+```
+
+---
+
+### PHASE 2: LLM Service Layer with Provider Pattern
+
+**Goal**: Multi-provider LLM service using abstract base class pattern
+
+**Tasks**:
+1. Create base LLM provider (implements core interface)
+   ```python
+   # llm/providers/base.py
+   from abc import ABC, abstractmethod
+   from agent_router.core.interfaces import LLMProvider
+   from agent_router.llm.models import LLMRequest, LLMResponse
+   from typing import AsyncIterator
+
+   class BaseLLMProvider(LLMProvider):
+       """Abstract base class for all LLM providers."""
+
+       def __init__(self, model: str, **config):
+           self.model = model
+           self.config = config
+
+       @abstractmethod
+       async def _call_api(self, request: LLMRequest) -> LLMResponse:
+           """Provider-specific API call."""
+           pass
+
+       @abstractmethod
+       async def _call_api_stream(self, request: LLMRequest) -> AsyncIterator[str]:
+           """Provider-specific streaming API call."""
+           pass
+
+       async def generate(self, prompt: str, **kwargs) -> str:
+           request = LLMRequest(prompt=prompt, **kwargs)
+           response = await self._call_api(request)
+           return response.text
+
+       async def generate_stream(self, prompt: str, **kwargs) -> AsyncIterator[str]:
+           request = LLMRequest(prompt=prompt, **kwargs)
+           async for chunk in self._call_api_stream(request):
+               yield chunk
+   ```
+
+2. Implement provider-specific classes
+   ```python
+   # llm/providers/openai_compatible.py
+   from agent_router.llm.providers.base import BaseLLMProvider
+   from openai import AsyncOpenAI
+
+   class OpenAIProvider(BaseLLMProvider):
+       def __init__(self, model: str = "gpt-4o-mini", api_key: str | None = None):
+           super().__init__(model)
+           self.client = AsyncOpenAI(api_key=api_key)
+
+       async def _call_api(self, request: LLMRequest) -> LLMResponse:
+           response = await self.client.chat.completions.create(
+               model=self.model,
+               messages=[{"role": "user", "content": request.prompt}],
+               temperature=request.temperature or 0.7
+           )
+           return LLMResponse(
+               text=response.choices[0].message.content,
+               model=self.model,
+               usage=response.usage.model_dump(),
+               provider="openai"
+           )
+
+       async def _call_api_stream(self, request: LLMRequest):
+           stream = await self.client.chat.completions.create(
+               model=self.model,
+               messages=[{"role": "user", "content": request.prompt}],
+               stream=True
+           )
+           async for chunk in stream:
+               if chunk.choices[0].delta.content:
+                   yield chunk.choices[0].delta.content
+
+   # llm/providers/lm_studio.py
+   class LMStudioProvider(BaseLLMProvider):
+       """LM Studio provider - uses OpenAI-compatible API."""
+       def __init__(self, model: str = "local-model", base_url: str = "http://localhost:1234/v1"):
+           super().__init__(model)
+           self.client = AsyncOpenAI(base_url=base_url, api_key="lm-studio")
+
+       async def _call_api(self, request: LLMRequest) -> LLMResponse:
+           # Similar to OpenAI but with base_url
+           ...
+
+   # llm/providers/gemini.py - similar pattern
+   # llm/providers/grok.py - similar pattern
+   ```
+
+3. Create LLM Service orchestrator
+   ```python
+   # llm/service.py
+   from agent_router.llm.providers.base import BaseLLMProvider
+   from agent_router.core.config import Settings
+   from agent_router.core.errors import LLMProviderError
+   from tenacity import retry, stop_after_attempt, wait_exponential
+
+   class LLMService:
+       """Orchestrates multiple LLM providers with retry and fallback."""
+
+       def __init__(self, settings: Settings):
+           self.providers: Dict[str, BaseLLMProvider] = {}
+           self._load_providers(settings)
+           self.default_provider = settings.default_llm_provider
+
+       def _load_providers(self, settings: Settings):
+           """Load configured providers."""
+           if settings.openai_api_key:
+               from agent_router.llm.providers.openai import OpenAIProvider
+               self.providers["openai"] = OpenAIProvider(api_key=settings.openai_api_key)
+
+           if settings.gemini_api_key:
+               from agent_router.llm.providers.gemini import GeminiProvider
+               self.providers["gemini"] = GeminiProvider(api_key=settings.gemini_api_key)
+
+           from agent_router.llm.providers.lm_studio import LMStudioProvider
+           self.providers["lm_studio"] = LMStudioProvider(base_url=settings.lm_studio_base_url)
+
+       @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10))
+       async def generate(
+           self,
+           prompt: str,
+           provider: str | None = None,
+           fallback: bool = True,
+           **kwargs
+       ) -> str:
+           """Generate response with retry and optional fallback."""
+           provider_name = provider or self.default_provider
+
+           try:
+               provider_instance = self.providers[provider_name]
+               return await provider_instance.generate(prompt, **kwargs)
+           except Exception as e:
+               if fallback and provider_name != "lm_studio":
+                   # Fallback to LM Studio
+                   return await self.providers["lm_studio"].generate(prompt, **kwargs)
+               raise LLMProviderError(f"All providers failed: {e}")
+
+       async def generate_stream(self, prompt: str, provider: str | None = None, **kwargs):
+           """Stream response from provider."""
+           provider_name = provider or self.default_provider
+           provider_instance = self.providers[provider_name]
+           async for chunk in provider_instance.generate_stream(prompt, **kwargs):
+               yield chunk
+   ```
+
+4. Create models
+   ```python
+   # llm/models.py
+   from pydantic import BaseModel
+
+   class LLMRequest(BaseModel):
+       prompt: str
+       temperature: float | None = None
+       max_tokens: int | None = None
+       system: str | None = None
+
+   class LLMResponse(BaseModel):
+       text: str
+       provider: str
+       model: str
+       usage: Dict[str, int]
+       latency_ms: float | None = None
+   ```
+
+**Deliverables**:
+- BaseLLMProvider abstract class
+- 4 provider implementations (OpenAI, Gemini, LM Studio, Grok)
+- LLMService orchestrator with retry and fallback
+- Clean separation: providers know nothing about storage
+
+**Verification**:
+```bash
+# Test LM Studio provider directly
+poetry run python -c "
+import asyncio
+from agent_router.llm.providers.lm_studio import LMStudioProvider
+
+async def test():
+    provider = LMStudioProvider()
+    response = await provider.generate('Say hello')
+    print(f'Response: {response}')
+
+asyncio.run(test())
+"
+
+# Test service with fallback
+poetry run python -c "
+import asyncio
+from agent_router.core.config import Settings
+from agent_router.llm.service import LLMService
+
+async def test():
+    settings = Settings()
+    service = LLMService(settings)
+    response = await service.generate('Hello', provider='lm_studio')
+    print(f'Response: {response}')
+
+asyncio.run(test())
+"
+```
+
+---
+
+### PHASE 3: Agent Layer Base Class
+
+**Goal**: Create reusable Agent base class with persona management, prompt building, and message history
+
+**Tasks**:
+1. Create agent models
+   ```python
+   # agent/models.py
+   from pydantic import BaseModel
+   from typing import List, Literal
+
+   class Message(BaseModel):
+       role: Literal["user", "assistant", "system"]
+       content: str
+       timestamp: datetime
+
+   class AgentContext(BaseModel):
+       """Context passed to agent for decision-making."""
+       available_tools: List[Dict]  # Tool descriptions
+       conversation_history: List[Message]
+       current_query: str
+   ```
+
+2. Create prompt builder
+   ```python
+   # agent/prompt_builder.py
+   from agent_router.core.config import AgentConfig
+
+   class PromptBuilder:
+       """Builds system prompts from agent configuration."""
+
+       def __init__(self, config: AgentConfig):
+           self.config = config
+
+       def build_system_prompt(self, available_tools: List[Dict] | None = None) -> str:
+           """Build complete system prompt from config."""
+           sections = []
+
+           if self.config.background:
+               sections.append(f"## Background\n{self.config.background}")
+
+           if self.config.goal:
+               sections.append(f"## Goal\n{self.config.goal}")
+
+           if self.config.task:
+               sections.append(f"## Task\n{self.config.task}")
+
+           if available_tools:
+               tools_desc = self._format_tools(available_tools)
+               sections.append(f"## Available Tools\n{tools_desc}")
+
+           if self.config.guidelines:
+               sections.append(f"## Guidelines\n{self.config.guidelines}")
+
+           if self.config.examples:
+               sections.append(f"## Examples\n{self.config.examples}")
+
+           if self.config.guardrails:
+               sections.append(f"## Guardrails\n{self.config.guardrails}")
+
+           return "\n\n".join(sections)
+
+       def _format_tools(self, tools: List[Dict]) -> str:
+           """Format tool list for prompt."""
+           return "\n".join([
+               f"- {tool['name']}: {tool['description']}"
+               for tool in tools
+           ])
+   ```
+
+3. Create base Agent class
+   ```python
+   # agent/base.py
+   from agent_router.core.config import AgentConfig
+   from agent_router.agent.prompt_builder import PromptBuilder
+   from agent_router.agent.models import Message, AgentContext
+   from typing import List
+
+   class Agent:
+       """Reusable base agent class with persona and conversation management."""
+
+       def __init__(self, config: AgentConfig):
+           self.config = config
+           self.prompt_builder = PromptBuilder(config)
+           self.conversation_history: List[Message] = []
+
+       def add_message(self, role: str, content: str):
+           """Add message to conversation history."""
+           self.conversation_history.append(
+               Message(role=role, content=content, timestamp=datetime.utcnow())
+           )
+
+       def get_windowed_history(self) -> List[Message]:
+           """Get conversation history based on window config."""
+           if self.config.message_window == "ALL":
+               return self.conversation_history
+           elif self.config.message_window.startswith("LAST_"):
+               n = int(self.config.message_window.split("_")[1])
+               return self.conversation_history[-n:]
+           else:
+               # Default to last 10
+               return self.conversation_history[-10:]
+
+       def build_context(self, query: str, available_tools: List[Dict] | None = None) -> AgentContext:
+           """Build agent context for LLM."""
+           return AgentContext(
+               available_tools=available_tools or [],
+               conversation_history=self.get_windowed_history(),
+               current_query=query
+           )
+
+       def clear_history(self):
+           """Clear conversation history."""
+           self.conversation_history = []
+   ```
+
+4. Create simple test configuration
+   ```yaml
+   # config/agents/test_agent.yaml
+   test_agent:
+     background: |
+       You are a test agent for verifying the agent framework.
+     goal: |
+       Respond to test queries to validate agent configuration.
+     message_window: "LAST_10"
+     max_context_tokens: 4000
+   ```
+
+**Deliverables**:
+- Reusable Agent base class
+- PromptBuilder utility
+- Message models and AgentContext
+- YAML configuration loading via AgentConfig
+- Message windowing (ALL, LAST_N)
+- Conversation history management
+
+**Verification**:
+```bash
+# Test agent configuration loading
+poetry run python -c "
+from agent_router.core.config import AgentConfig
+from agent_router.agent.base import Agent
+
+# Load config
+config = AgentConfig.from_yaml('config/agents/test_agent.yaml')
+print(f'Loaded agent: {config.name}')
+
+# Create agent
+agent = Agent(config)
+
+# Test prompt building
+system_prompt = agent.prompt_builder.build_system_prompt()
+print(f'System prompt length: {len(system_prompt)} chars')
+print('First 200 chars:', system_prompt[:200])
+
+# Test message history
+agent.add_message('user', 'Hello')
+agent.add_message('assistant', 'Hi there!')
+print(f'History messages: {len(agent.conversation_history)}')
+
+# Test windowing
+windowed = agent.get_windowed_history()
+print(f'Windowed messages: {len(windowed)}')
+print('Agent base class working!')
+"
+```
+
+---
+
+### PHASE 4: MCP Integration (Existing Servers)
+
+**Goal**: Connect to existing MCP servers, discover tools, and execute tool calls
+
+**Prerequisites**:
+```bash
+# Install MCP servers globally
+npm install -g @modelcontextprotocol/server-filesystem
+npm install -g @modelcontextprotocol/server-everything
+```
+
+**Tasks**:
+1. Create MCP models
+   ```python
+   # connectors/mcp/models.py
+   from pydantic import BaseModel
+   from typing import Dict, Any, List
+
+   class MCPTool(BaseModel):
+       name: str
+       description: str
+       parameters: Dict[str, Any]  # JSON schema
+       server: str  # which MCP server provides this
+
+   class MCPToolCall(BaseModel):
+       tool_name: str
+       parameters: Dict[str, Any]
+
+   class MCPToolResult(BaseModel):
+       success: bool
+       result: Any | None = None
+       error: str | None = None
+   ```
+
+2. Create MCP client using official Python SDK (implements ToolConnector interface)
+   ```python
+   # connectors/mcp/client.py
+   from agent_router.core.interfaces import ToolConnector
+   from agent_router.connectors.mcp.models import MCPTool, MCPToolResult
+   from mcp import ClientSession, StdioServerParameters
+   from mcp.client.stdio import stdio_client
+   from typing import Dict, List, Any
+
+   class MCPClient(ToolConnector):
+       """Client for communicating with MCP servers using official SDK.
+
+       MCP Protocol Overview:
+       - Uses JSON-RPC 2.0 for message communication
+       - Transports: stdio (local), HTTP/WebSocket (remote)
+       - Core methods: initialize, tools/list, tools/call, resources/list, resources/read
+
+       Reference: https://modelcontextprotocol.io/specification/2025-11-25
+       """
+
+       def __init__(self, server_name: str, server_config: Dict):
+           self.server_name = server_name
+           self.server_config = server_config
+           self.session: ClientSession | None = None
+           self.tools: List[MCPTool] = []
+
+       async def connect(self, config: Dict) -> None:
+           """Start MCP server process and discover tools via stdio transport."""
+           command = config["command"]
+           args = config.get("args", [])
+
+           # Create server parameters for stdio transport
+           server_params = StdioServerParameters(
+               command=command,
+               args=args,
+               env=None  # Optional environment variables
+           )
+
+           # Connect to MCP server using stdio transport
+           async with stdio_client(server_params) as (read, write):
+               async with ClientSession(read, write) as session:
+                   self.session = session
+
+                   # Initialize connection
+                   await session.initialize()
+
+                   # Discover available tools
+                   await self._discover_tools()
+
+       async def _discover_tools(self):
+           """Query server for available tools using tools/list method."""
+           if not self.session:
+               raise RuntimeError("Not connected to MCP server")
+
+           # Call tools/list to get available tools
+           response = await self.session.list_tools()
+
+           # Convert to our MCPTool models
+           self.tools = [
+               MCPTool(
+                   name=tool.name,
+                   description=tool.description,
+                   parameters=tool.inputSchema,  # JSON schema
+                   server=self.server_name
+               )
+               for tool in response.tools
+           ]
+
+       async def list_tools(self) -> List[MCPTool]:
+           """Return list of available tools."""
+           return self.tools
+
+       async def execute(self, tool_name: str, parameters: Dict) -> MCPToolResult:
+           """Execute a tool call via MCP protocol using tools/call method.
+
+           MCP tools/call request format:
+           {
+               "jsonrpc": "2.0",
+               "id": 1,
+               "method": "tools/call",
+               "params": {
+                   "name": "tool_name",
+                   "arguments": {"param": "value"}
+               }
+           }
+
+           Response format:
+           {
+               "jsonrpc": "2.0",
+               "id": 1,
+               "result": {
+                   "content": [{"type": "text", "text": "result"}]
+               }
+           }
+           """
+           if not self.session:
+               return MCPToolResult(success=False, error="Not connected to MCP server")
+
+           try:
+               # Call tool using MCP SDK
+               response = await self.session.call_tool(
+                   name=tool_name,
+                   arguments=parameters
+               )
+
+               # Extract result from content blocks
+               # MCP returns content as array of text/image/resource blocks
+               result_data = {
+                   "content": [
+                       {"type": item.type, "text": item.text if hasattr(item, "text") else None}
+                       for item in response.content
+                   ]
+               }
+
+               return MCPToolResult(success=True, result=result_data)
+
+           except Exception as e:
+               return MCPToolResult(success=False, error=str(e))
+
+       async def disconnect(self):
+           """Disconnect from MCP server (handled by context managers)."""
+           # Connection cleanup is handled by async context managers
+           # in the connect() method
+           pass
+   ```
+
+   **MCP Protocol Notes:**
+   - **Transport**: stdio (standard input/output) for local servers
+   - **Message Format**: JSON-RPC 2.0 with methods like `tools/list`, `tools/call`
+   - **Tool Schema**: Tools have `inputSchema` (JSON Schema) for parameter validation
+   - **Content Types**: Responses contain content blocks (text, image, resource)
+   - **Session Lifecycle**: initialize → list tools → call tools → disconnect
+
+   **Official SDK Benefits:**
+   - Handles JSON-RPC protocol automatically
+   - Manages stdio communication
+   - Provides typed Python interfaces
+   - Handles errors and edge cases
+
+3. Create tool registry
+   ```python
+   # connectors/mcp/registry.py
+   from agent_router.connectors.mcp.client import MCPClient
+   from agent_router.connectors.mcp.models import MCPTool
+   from typing import List, Dict
+   import yaml
+
+   class ToolRegistry:
+       """Discovers and manages tools from multiple MCP servers."""
+
+       def __init__(self, mcp_servers_config_path: str = "config/mcp_servers.yaml"):
+           self.clients: Dict[str, MCPClient] = {}
+           self.all_tools: List[MCPTool] = []
+           self.config_path = mcp_servers_config_path
+
+       async def initialize(self):
+           """Load config and connect to all enabled MCP servers."""
+           with open(self.config_path) as f:
+               config = yaml.safe_load(f)
+
+           for server_name, server_config in config.get("servers", {}).items():
+               if server_config.get("enabled", False) and server_config.get("type") == "mcp":
+                   client = MCPClient(server_config)
+                   await client.connect(server_config)
+                   self.clients[server_name] = client
+
+                   # Collect tools from this server
+                   tools = await client.list_tools()
+                   self.all_tools.extend(tools)
+
+       def list_tools(self) -> List[Dict]:
+           """Get all tools as dicts for LLM context."""
+           return [
+               {
+                   "name": tool.name,
+                   "description": tool.description,
+                   "parameters": tool.parameters,
+                   "server": tool.server
+               }
+               for tool in self.all_tools
+           ]
+
+       def get_tool(self, tool_name: str) -> MCPTool | None:
+           """Get specific tool by name."""
+           for tool in self.all_tools:
+               if tool.name == tool_name:
+                   return tool
+           return None
+
+       def get_client_for_tool(self, tool_name: str) -> MCPClient | None:
+           """Get the MCP client that provides this tool."""
+           tool = self.get_tool(tool_name)
+           if tool:
+               return self.clients.get(tool.server)
+           return None
+
+       async def shutdown(self):
+           """Disconnect all MCP clients."""
+           for client in self.clients.values():
+               await client.disconnect()
+   ```
+
+4. Create manual test script
+   ```python
+   # tests/manual/test_mcp.py
+   import asyncio
+   from agent_router.connectors.mcp.registry import ToolRegistry
+
+   async def main():
+       # Initialize registry
+       registry = ToolRegistry()
+       await registry.initialize()
+
+       # List tools
+       tools = registry.list_tools()
+       print(f"Found {len(tools)} tools:")
+       for tool in tools:
+           print(f"  - {tool['name']}: {tool['description']}")
+
+       # Test a tool call (filesystem.read_file)
+       client = registry.get_client_for_tool("read_file")
+       if client:
+           result = await client.execute("read_file", {"path": "test.txt"})
+           print(f"Result: {result}")
+
+       # Shutdown
+       await registry.shutdown()
+
+   if __name__ == "__main__":
+       asyncio.run(main())
+   ```
+
+**Deliverables**:
+- MCPClient implements ToolConnector interface
+- ToolRegistry discovers tools from multiple MCP servers
+- Can connect to 2+ existing MCP servers (filesystem, everything)
+- Can list available tools
+- Can execute tool calls via MCP protocol
+- Proper error handling and connection management
+
+**Verification**:
+```bash
+# MCP discovery
+python tests/manual/test_mcp_servers.py
+
+# MCP tool call via orchestrator
+python tests/manual/test_mcp_tool_calls.py
+```
+
+**Retry Settings**:
+Define per-server retry values in `config/mcp_servers.yaml`:
+`retry_max_retries`, `retry_base_delay`, `retry_max_delay`, `retry_exponential_base`.
+
+---
+
+### PHASE 5A: Orchestrator (Dumb Executor) ✅ **COMPLETED**
+
+**Goal**: Execute tool calls and store tool executions without making decisions
+
+**Verification**:
+```bash
+python tests/manual/test_mcp_tool_calls.py
+```
+
+---
+
+### PHASE 5B: Agentic Tool Loop (Decisions) ✅ **COMPLETED**
+
+**Note**: Orchestrator work is complete in Phase 5A. This phase focuses on the
+agentic tool-call loop, streaming behavior, and decision-making. Any remaining
+orchestrator snippets below are legacy and will be pruned.
+
+**Goal**: Build the Agent Layer with ALL decision-making logic (no separate routing agent).
+
+**Tasks**:
+1. Finalize routing decision schema for tool calls (inputs/outputs).
+2. Load MCP tool contracts via `Agent.load_mcp_tools()` before LLM calls.
+3. Wire tool-call loop in `src/agent_router/agent/base.py`:
+   - LLM call → persist → tool execution → append messages → loop.
+   - Support streaming and non-streaming with shared loop.
+4. Add allowlist enforcement tests for tool contracts.
+5. Ensure streaming events use typed `LLMStreamChunk`.
+
+**Deliverables**:
+- Agent Layer with coordination logic (no separate routing agent)
+- LLM calls stored by Agent; tool executions stored by Orchestrator
+- Streaming + non-streaming tool loop verified
+
+**Verification**:
+```bash
+python tests/manual/test_agent_tool_calls_stream.py
+python tests/manual/test_mcp_tool_calls.py
+```
+
+---
+
+### PHASE 6: MCP Tools (Integration)
+
+**Goal**: Integrate existing MCP servers and validate tool access
+
+**Tasks**:
+1. Integrate existing MCP servers and validate via manual tests
+
+**Deliverables**:
+- Existing MCP servers integrated and validated
+
+**Verification**:
+```bash
+python tests/manual/test_mcp_servers.py
+python tests/manual/test_mcp_filesystem_ops.py
+python tests/manual/test_router_runtime.py
+```
+
+---
+
+### PHASE 7: External UI via OpenAI-Compatible Adapter
+
+**Goal**: Stop maintaining custom UI code and use an existing chat client.
+
+**Approach**: Expose backend through FastAPI adapter and connect Open WebUI/LibreChat.
+
+**Tasks**:
+1. Implement adapter endpoints:
+   - `GET /v1/models`
+   - `POST /v1/chat/completions` (stream + non-stream)
+2. Keep tool orchestration in backend (UI is presentation only).
+3. Connect external UI to adapter base URL (`/v1`).
+
+**Deliverables**:
+- `src/agent_router/api/openai_adapter.py`
+- External UI integration path (Open WebUI/LibreChat)
+- No in-repo Gradio UI dependency
+
+**Verification**:
+```bash
+python -m agent_router.api.openai_adapter
+curl http://127.0.0.1:8000/v1/models
+```
+
+---
+
+### PHASE 8: Custom MCP Tools
+
+**Goal**: Create 2-3 custom MCP tools after UI validation
+
+**Tasks**:
+1. Design custom tools
+   - Code analyzer (analyzes Python files)
+   - Data transformer (JSON ↔ YAML ↔ CSV)
+   - Text summarizer (extractive summary)
+2. Build MCP server
+   ```python
+   # src/mcp_servers/custom_server.py
+   # Implement MCP protocol
+   # Register custom tools
+   ```
+3. Implement tool handlers
+   ```python
+   # src/mcp_servers/tools/code_analyzer.py
+   async def analyze(file_path: str) -> Dict
+   ```
+4. Integrate with main agent
+
+**Deliverables**:
+- 2-3 custom MCP tools working
+- Integrated with main agent
+- Custom tools callable via main agent
+
+**Verification**:
+```bash
+# Start custom server
+poetry run python -m mcp_servers.custom_server
+
+# Test via main agent
+poetry run python -m agent_router.main \
+  --query "Analyze src/agent_router/agent/agent.py"
+```
+
+---
+
+### PHASE 9: MCP Agents
+
+**Goal**: Create MCP agents (stateful, conversational) by reusing Agent Layer
+
+**Tasks**:
+1. Define MCP agent protocol (vs tools)
+   - Tools: Stateless, single function
+   - Agents: Stateful, conversational, use Agent Layer
+
+2. Create example agents **using Agent Layer**
+   - Summarizer agent (multi-turn refinement)
+     ```python
+     # Reuse Agent Layer for persona management
+     class SummarizerAgent:
+         def __init__(self):
+             self.agent = Agent(config="config/agents/summarizer.yaml")
+             self.llm_service = LLMService(...)
+     ```
+   - Researcher agent (iterative research)
+     ```python
+     class ResearcherAgent:
+         def __init__(self):
+             self.agent = Agent(config="config/agents/researcher.yaml")
+             self.llm_service = LLMService(...)
+     ```
+
+3. Create agent-specific YAML configs
+   ```yaml
+   # config/agents/summarizer.yaml
+   summarizer_agent:
+     background: You are a specialized summarization agent...
+     goal: Create concise, accurate summaries...
+   ```
+
+4. Implement agent session management
+
+5. Update main agent to differentiate tools vs agents
+
+**Key Point**: MCP Agents are built using the same Agent Layer component as
+the Main Agent. This provides consistent persona management, prompt handling,
+and conversation state across all agents.
+
+**Deliverables**:
+- 2 MCP agents working
+- Main agent can route to agents
+- Multi-turn conversations working
+- Session state persisted
+
+**Verification**:
+```bash
+poetry run python -m agent_router.main \
+  --session "research-1" \
+  --query "Research MCP protocol"
+
+poetry run python -m agent_router.main \
+  --session "research-1" \
+  --query "Tell me more about agent-to-agent communication"
+```
+
+---
+
+### PHASE 10: A2A Protocol
+
+**Goal**: Support remote agents via A2A protocol using official Python SDK
+
+**A2A Protocol Overview:**
+- **Purpose**: Enable communication between independent AI agent systems
+- **Transport**: JSON-RPC 2.0 over HTTP(S), also supports gRPC
+- **Discovery**: Agent Cards at `/.well-known/agent-card.json`
+- **Communication Patterns**: Synchronous, streaming (SSE), async (webhooks)
+- **Reference**: https://a2a-protocol.org/latest/specification/
+
+**Tasks**:
+1. Create A2A models
+   ```python
+   # connectors/a2a/models.py
+   from pydantic import BaseModel
+   from typing import List, Literal, Dict, Any
+
+   class A2AMessage(BaseModel):
+       """A2A protocol message structure."""
+       messageId: str
+       role: Literal["user", "agent"]
+       parts: List[Dict[str, Any]]  # text, file, or data parts
+       contextId: str | None = None
+       taskId: str | None = None
+
+   class A2ATask(BaseModel):
+       """A2A task representation."""
+       id: str
+       contextId: str
+       status: Dict[str, str]  # state: submitted/working/completed/failed
+       artifacts: List[Dict[str, Any]] | None = None
+
+   class A2AAgentCard(BaseModel):
+       """Agent Card for discovery."""
+       protocolVersion: str
+       name: str
+       supportedInterfaces: List[Dict[str, str]]  # url, protocolBinding
+       capabilities: Dict[str, bool]  # streaming, pushNotifications
+       skills: List[Dict[str, Any]]  # id, name, inputModes, outputModes
+
+   class A2AToolCall(BaseModel):
+       """Wrapper for A2A agent calls."""
+       agent_name: str
+       message: A2AMessage
+       configuration: Dict[str, Any] | None = None
+
+   class A2AToolResult(BaseModel):
+       """Result from A2A agent call."""
+       success: bool
+       task: A2ATask | None = None
+       error: str | None = None
+   ```
+
+2. Create A2A client using official Python SDK (implements ToolConnector interface)
+   ```python
+   # connectors/a2a/client.py
+   from agent_router.core.interfaces import ToolConnector
+   from agent_router.connectors.a2a.models import (
+       A2AAgentCard, A2AMessage, A2ATask, A2AToolResult
+   )
+   from a2a_sdk import A2AClient as SDKClient, Message, MessagePart
+   from typing import Dict, List, Any
+   import httpx
+
+   class A2AClient(ToolConnector):
+       """Client for communicating with remote A2A agents using official SDK.
+
+       A2A Protocol Overview:
+       - Uses JSON-RPC 2.0 over HTTP(S)
+       - Agents publish capabilities via Agent Card at /.well-known/agent-card.json
+       - Core methods: SendMessage, GetTask, ListTasks, CancelTask
+       - Supports streaming via Server-Sent Events (SSE)
+       - Supports async updates via webhooks
+
+       Reference: https://a2a-protocol.org/latest/specification/
+       """
+
+       def __init__(self, agent_name: str, agent_config: Dict):
+           self.agent_name = agent_name
+           self.agent_config = agent_config
+           self.base_url = agent_config["url"]
+           self.client: SDKClient | None = None
+           self.agent_card: A2AAgentCard | None = None
+
+       async def connect(self, config: Dict) -> None:
+           """Discover agent capabilities via Agent Card."""
+           # Initialize A2A SDK client
+           self.client = SDKClient(base_url=self.base_url)
+
+           # Fetch Agent Card for capability discovery
+           await self._discover_capabilities()
+
+       async def _discover_capabilities(self):
+           """Fetch Agent Card from /.well-known/agent-card.json.
+
+           Agent Card structure:
+           {
+               "protocolVersion": "0.3.0",
+               "name": "Example Agent",
+               "supportedInterfaces": [
+                   {"url": "https://agent.example.com/a2a/v1", "protocolBinding": "JSONRPC"}
+               ],
+               "capabilities": {"streaming": true, "pushNotifications": false},
+               "skills": [{"id": "skill-1", "name": "Task Handler"}]
+           }
+           """
+           async with httpx.AsyncClient() as http_client:
+               response = await http_client.get(
+                   f"{self.base_url}/.well-known/agent-card.json"
+               )
+               response.raise_for_status()
+               card_data = response.json()
+               self.agent_card = A2AAgentCard(**card_data)
+
+       async def list_tools(self) -> List[Dict]:
+           """Return agent skills as tools for LLM context.
+
+           In A2A, 'skills' are analogous to 'tools' in MCP.
+           """
+           if not self.agent_card:
+               return []
+
+           return [
+               {
+                   "name": f"{self.agent_name}.{skill['id']}",
+                   "description": skill.get("name", skill["id"]),
+                   "parameters": {
+                       "type": "object",
+                       "properties": {
+                           "message": {"type": "string", "description": "Message to send to agent"}
+                       },
+                       "required": ["message"]
+                   },
+                   "server": self.agent_name,
+                   "tool_type": "a2a_agent"
+               }
+               for skill in self.agent_card.skills
+           ]
+
+       async def execute(self, tool_name: str, parameters: Dict) -> A2AToolResult:
+           """Execute agent call via A2A protocol using SendMessage.
+
+           A2A SendMessage request (JSON-RPC over HTTP):
+           POST /v1/message:send
+           Headers: A2A-Version: 0.3
+           {
+               "message": {
+                   "messageId": "uuid",
+                   "role": "user",
+                   "parts": [{"text": "user query"}]
+               },
+               "configuration": {
+                   "acceptedOutputModes": ["text/plain"]
+               }
+           }
+
+           Response:
+           {
+               "task": {
+                   "id": "task-uuid",
+                   "contextId": "context-uuid",
+                   "status": {"state": "completed"},
+                   "artifacts": [{"artifactId": "artifact-1", "parts": [...]}]
+               }
+           }
+           """
+           if not self.client:
+               return A2AToolResult(success=False, error="Not connected to A2A agent")
+
+           try:
+               # Create A2A message from parameters
+               message_text = parameters.get("message", "")
+               message = Message(
+                   role="user",
+                   parts=[MessagePart(text=message_text)]
+               )
+
+               # Send message to A2A agent
+               response = await self.client.send_message(
+                   message=message,
+                   configuration={
+                       "acceptedOutputModes": ["text/plain", "application/json"]
+                   }
+               )
+
+               # Convert response to our model
+               task = A2ATask(
+                   id=response.task.id,
+                   contextId=response.task.contextId,
+                   status=response.task.status,
+                   artifacts=response.task.artifacts
+               )
+
+               return A2AToolResult(success=True, task=task)
+
+           except Exception as e:
+               return A2AToolResult(success=False, error=str(e))
+
+       async def disconnect(self):
+           """Disconnect from A2A agent (cleanup)."""
+           if self.client:
+               await self.client.close()
+   ```
+
+3. Build example A2A server (for testing) **using Agent Layer**
+   ```python
+   # connectors/a2a/example_server.py
+   from a2a_sdk import A2AServer, Message, Task, TaskStatus
+   from agent_router.agent.base import Agent
+   from agent_router.core.config import AgentConfig
+   from agent_router.llm.service import LLMService
+   import uvicorn
+
+   class CalculatorAgent:
+       """Example A2A agent using Agent Layer for persona management."""
+
+       def __init__(self):
+           # Use Agent Layer for consistent persona and prompting
+           config = AgentConfig.from_yaml("config/agents/calculator.yaml")
+           self.agent = Agent(config)
+           self.llm_service = LLMService(...)
+
+       async def handle_message(self, message: Message) -> Task:
+           """Process incoming A2A message."""
+           # Extract user query from message parts
+           user_query = " ".join([
+               part.text for part in message.parts if hasattr(part, "text")
+           ])
+
+           # Add to agent's conversation history
+           self.agent.add_message("user", user_query)
+
+           # Get response from LLM via Agent Layer
+           system_prompt = self.agent.prompt_builder.build_system_prompt()
+           history = self.agent.get_windowed_history()
+
+           response = await self.llm_service.generate(
+               system_prompt=system_prompt,
+               messages=history,
+               provider="openai"
+           )
+
+           # Store assistant response
+           self.agent.add_message("assistant", response)
+
+           # Return as A2A Task
+           return Task(
+               status=TaskStatus(state="completed"),
+               artifacts=[{
+                   "artifactId": "result-1",
+                   "parts": [{"text": response}]
+               }]
+           )
+
+   # Create A2A server
+   async def main():
+       agent = CalculatorAgent()
+
+       # Create A2A server with Agent Card
+       server = A2AServer(
+           name="Calculator Agent",
+           version="1.0.0",
+           skills=[{
+               "id": "calculate",
+               "name": "Mathematical Calculator",
+               "inputModes": ["text/plain"],
+               "outputModes": ["text/plain"]
+           }],
+           capabilities={"streaming": False, "pushNotifications": False}
+       )
+
+       # Register message handler
+       server.on_message(agent.handle_message)
+
+       # Start server
+       await server.serve(host="0.0.0.0", port=8000)
+
+   if __name__ == "__main__":
+       import asyncio
+       asyncio.run(main())
+   ```
+
+4. Update tool registry to include A2A agents
+   ```python
+   # Update connectors/mcp/registry.py to also handle A2A
+   async def initialize(self):
+       """Load config and connect to all enabled MCP and A2A servers."""
+       with open(self.config_path) as f:
+           config = yaml.safe_load(f)
+
+       # Connect to MCP servers
+       for server_name, server_config in config.get("servers", {}).items():
+           if server_config.get("enabled") and server_config.get("type") == "mcp":
+               # ... MCP connection logic
+
+       # Connect to A2A agents
+       for agent_name, agent_config in config.get("a2a_agents", {}).items():
+           if agent_config.get("enabled"):
+               from agent_router.connectors.a2a.client import A2AClient
+               client = A2AClient(agent_name, agent_config)
+               await client.connect(agent_config)
+               self.clients[agent_name] = client
+
+               # Add A2A agent skills as tools
+               tools = await client.list_tools()
+               self.all_tools.extend(tools)
+   ```
+
+**A2A Protocol Notes:**
+- **Transport**: JSON-RPC 2.0 over HTTP(S), production requires HTTPS/TLS
+- **Discovery**: Agent Card at `/.well-known/agent-card.json` describes capabilities
+- **Message Structure**: Messages have role (user/agent) and parts (text/file/data)
+- **Task Lifecycle**: submitted → working → completed/failed/cancelled
+- **Streaming**: Supports Server-Sent Events (SSE) for real-time updates
+- **Async**: Supports webhook-based push notifications for long-running tasks
+- **Authentication**: OAuth2, API keys, or custom schemes defined in Agent Card
+
+**Key Point**: A2A agents can be built using the same Agent Layer component,
+providing consistent persona management and prompting, but they run as remote
+services accessible over HTTP/WebSocket.
+
+**Deliverables**:
+- A2A client using official Python SDK
+- Can discover remote agents via Agent Card
+- Can call remote agents using SendMessage
+- Example A2A server using Agent Layer
+- Integrated with tool registry and orchestrator
+
+**Verification**:
+```bash
+# Start example A2A server
+poetry run python -m agent_router.connectors.a2a.example_server
+
+# Test agent card discovery
+curl http://localhost:8000/.well-known/agent-card.json
+
+# Test via main agent
+poetry run python -m agent_router.main \
+  --query "Use calculator agent to compute 15 * 24"
+
+# Verify A2A task logged to MongoDB
+mongosh agent_router --eval "db.tool_executions.find({tool_type: 'a2a_agent'}).pretty()"
+```
+
+---
+
+### PHASE 11: Multi-Provider Testing & Optimization
+
+**Goal**: Test with all LLM providers, optimize
+
+**Tasks**:
+1. Test with all providers
+   - OpenAI (GPT-4, GPT-3.5)
+   - Gemini
+   - LM Studio (Llama, Mistral, Qwen)
+   - Grok
+
+2. Benchmark performance
+   - Latency per provider
+   - Token usage
+   - Routing accuracy
+
+3. Optimize prompts
+
+4. Add observability
+   - Structured logging
+   - Metrics collection
+
+**Deliverables**:
+- Works with all providers
+- Performance benchmarks
+- Observability and logging
+
+**Verification**:
+```bash
+# Manual testing with each provider
+poetry run python -m agent_router.main --provider lm_studio --query "test"
+poetry run python -m agent_router.main --provider openai --query "test"
+poetry run python -m agent_router.main --provider gemini --query "test"
+
+# Compare benchmarks
+poetry run python benchmarks/provider_comparison.py
+
+# Review MongoDB logs
+mongosh agent_router --eval "db.llm_calls.aggregate([{$group: {_id: '$provider', count: {$sum: 1}, avg_latency: {$avg: '$latency_ms'}}}])"
+```
+
+---
+
+### PHASE 12: Documentation & Examples
+
+**Goal**: Complete documentation
+
+**Tasks**:
+1. Write comprehensive README
+   - Project overview and architecture
+   - Quickstart guide
+   - Installation instructions
+   - Configuration guide
+   - UI usage guide
+
+2. Create API documentation
+   - Document all public APIs
+   - Add docstrings
+   - Generate docs with Sphinx or mkdocs
+
+3. Build 4+ example applications
+   - File processor (read, analyze, transform)
+   - Web researcher (search, summarize, save)
+   - Multi-agent workflow (use multiple agents)
+   - Database query assistant
+
+4. Create tutorial notebooks
+   - Getting started
+   - Creating custom MCP tools
+   - Building MCP agents
+   - Using the UI
+
+5. Write troubleshooting guide
+   - Common issues
+   - LM Studio setup
+   - MongoDB setup
+   - MCP server configuration
+
+**Deliverables**:
+- Complete documentation
+- Working examples
+- Tutorials
+- Troubleshooting guide
+
+**Verification**:
+```bash
+poetry run python examples/file_processor.py
+poetry run python examples/web_researcher.py
+poetry run python examples/multi_agent_workflow.py
+poetry run python examples/database_assistant.py
+```
+
+---
+
+## Configuration Files
+
+### .env.example
+
+```bash
+# LLM Providers
+OPENAI_API_KEY=sk-...
+GEMINI_API_KEY=AI...
+
+# LM Studio
+LM_STUDIO_BASE_URL=http://localhost:1234/v1
+
+# MongoDB (local)
+MONGODB__URI=mongodb://localhost:27017/?retryWrites=false
+MONGODB__DATABASE=agent_router
+
+# Fallback config (used when agent omits params or retries exhaust)
+FALLBACK_LLM_PROVIDER=
+FALLBACK_LLM_MODEL=
+FALLBACK_TEMPERATURE=
+FALLBACK_MAX_TOKENS=
+FALLBACK_TOP_P=
+FALLBACK_TOP_K=
+FALLBACK_THINKING_BUDGET=
+FALLBACK_THINKING_EFFORT=
+
+# LLM retry configuration
+LLM_RETRY_MAX_RETRIES=3
+LLM_RETRY_BASE_DELAY=1.0
+LLM_RETRY_MAX_DELAY=10.0
+LLM_RETRY_EXPONENTIAL_BASE=2.0
+
+# Logging
+LOG_LEVEL=INFO
+```
+
+### config/llm_models.yaml
+
+```yaml
+providers:
+  lm_studio:
+    models:
+      openai/gpt-oss-20b:
+        supports_temperature: true
+        supports_top_p: true
+        supports_top_k: true
+        supports_tools: true
+        supports_response_format: true
+        supports_thinking_effort: true
+        supports_thinking_budget: false
+        max_tokens_param: max_tokens
+      zai-org/glm-4.7-flash:
+        supports_temperature: true
+        supports_top_p: true
+        supports_top_k: true
+        supports_tools: true
+        supports_response_format: true
+        supports_thinking_effort: false
+        supports_thinking_budget: false
+        enable_thinking: true
+        tool_schema: responses
+        tools_api_mode: chat_completions
+        max_tokens_param: max_tokens
+```
+
+### config/mcp_servers.yaml
+
+```yaml
+servers:
+  filesystem:
+    command: npx
+    args:
+      - "@modelcontextprotocol/server-filesystem"
+      - "."
+  everything:
+    command: npx
+    args:
+      - "@modelcontextprotocol/server-everything"
+```
+  remote_specialist:
+    type: "a2a"
+    url: "http://localhost:8001/agent"
+    enabled: false
+```
+
+### config/agents/router.yaml
+
+```yaml
+router:
+  background: |
+    You are an intelligent autonomous agent with access to various tools and agents
+    including file system operations, web search, databases, and specialized agents.
+
+  goal: |
+    Help users accomplish tasks efficiently by selecting and using the right
+    tools or agents from your available arsenal.
+
+  task: |
+    Analyze the user's query and determine:
+    1. Which tool(s) or agent(s) to use
+    2. What parameters to pass to each
+    3. In what order to execute them (sequential or parallel)
+
+  guidelines: |
+    - Match user intent to tool/agent capabilities precisely
+    - Validate parameters before execution
+    - Choose simpler solutions over complex ones
+    - Plan for multi-step tasks when necessary
+    - Handle errors gracefully with retries or alternatives
+
+  examples: |
+    Query: "Read the contents of data.txt"
+    Routing: {
+      "tools": [{"name": "filesystem.read_file", "params": {"path": "data.txt"}}],
+      "reasoning": "Simple file read operation",
+      "execution_order": "sequential"
+    }
+
+    Query: "Search web for Python tutorials and save top 3 to file"
+    Routing: {
+      "tools": [
+        {"name": "fetch.web_search", "params": {"query": "Python tutorials", "limit": 3}},
+        {"name": "filesystem.write_file", "params": {"path": "results.txt", "content": "$prev_result"}}
+      ],
+      "reasoning": "Multi-step: search then save",
+      "execution_order": "sequential"
+    }
+
+  guardrails: |
+    - Never execute destructive file operations without explicit confirmation
+    - Respect file system boundaries (no access outside allowed paths)
+    - Don't expose sensitive information
+    - Validate all user inputs before tool execution
+```
+
+### config/agents/summarizer.yaml
+
+```yaml
+summarizer:
+  background: |
+    You are a specialized text summarization agent.
+    You excel at condensing long documents into concise, accurate summaries.
+
+  goal: |
+    Provide clear, structured summaries of text documents
+    highlighting key points, main ideas, and important details.
+
+  task: |
+    When given a document:
+    1. Identify the main topic and purpose
+    2. Extract key points and supporting details
+    3. Create a structured summary with:
+       - Brief overview (1-2 sentences)
+       - Main points (3-5 bullet points)
+       - Conclusion or implications
+
+  guidelines: |
+    - Keep summaries concise (typically 20-30% of original length)
+    - Preserve factual accuracy
+    - Use clear, neutral language
+    - Structure information hierarchically
+    - Include important statistics or quotes when relevant
+
+  guardrails: |
+    - Never add information not present in the source
+    - Don't include personal opinions or interpretations
+    - Maintain objectivity
+```
+
+### config/agents/researcher.yaml
+
+```yaml
+researcher:
+  background: |
+    You are a specialized research agent capable of finding, analyzing,
+    and synthesizing information from multiple sources.
+
+  goal: |
+    Help users gather comprehensive, accurate information on topics
+    by searching, analyzing, and summarizing relevant sources.
+
+  task: |
+    When given a research query:
+    1. Identify key search terms and concepts
+    2. Search for relevant information (web, databases)
+    3. Evaluate source credibility
+    4. Synthesize findings into coherent report
+    5. Cite sources appropriately
+
+  guidelines: |
+    - Use multiple sources for verification
+    - Prioritize recent, authoritative sources
+    - Present balanced perspectives on controversial topics
+    - Organize findings logically (by theme, chronology, etc.)
+    - Provide source citations
+
+  examples: |
+    Query: "Research the latest developments in quantum computing"
+    Process:
+    1. Search web for "quantum computing 2024 developments"
+    2. Filter for recent academic and industry sources
+    3. Extract key breakthroughs and trends
+    4. Synthesize into structured report with citations
+
+  guardrails: |
+    - Only cite information from accessed sources
+    - Flag uncertain or conflicting information
+    - Don't make predictions beyond source data
+    - Acknowledge limitations of available information
+```
+
+## Success Criteria
+
+The POC is complete when:
+
+1. ✅ Single main agent handles all queries
+2. ✅ Connects to 3+ existing MCP servers
+3. ✅ Creates 2-3 custom MCP tools
+4. ✅ Creates 2 MCP agents
+5. ✅ Supports A2A protocol
+6. ✅ Works with 4+ LLM providers (including local via LM Studio)
+7. ✅ Every LLM call logged to MongoDB (by Agent Layer)
+8. ✅ Every tool execution logged to MongoDB (by Orchestrator)
+9. ✅ Self-healing error recovery working
+10. ✅ **Streaming and non-streaming modes working**
+11. ✅ **Web UI with streaming toggle**
+12. ✅ Complete documentation with examples
+
+## Key Design Decisions
+
+> **📖 Complete Rationale**: See [architecture.mdc - Key Design Decisions](.cursor/rules/architecture.mdc#key-design-decisions) for detailed explanations of all 10+ architectural decisions.
+
+**Quick Reference** - These decisions drive the implementation:
+1. **Agent Layer Does EVERYTHING** - Main/Orchestrator are dumb, Agent is smart
+2. **Separate LLM Calls from Tool Executions** - Different MongoDB collections, different owners
+3. **Use Official SDKs** - MCP and A2A use official Python libraries
+4. **Streaming AND Non-Streaming** - Support both modes throughout stack
+5. **Repository Pattern** - Clean data access with dependency injection
+
+## Phase Implementation Review
+
+### Phase Clarity & Feasibility Summary
+
+**PHASE 0: Project Setup & Core Abstractions** ✅
+- **Clarity**: Excellent - Clear steps for Poetry init, local MongoDB setup, core module creation
+- **Feasibility**: High - Standard setup tasks, well-defined interfaces
+- **Deliverables**: Testable - Verification checks all imports and MongoDB connection
+- **Success Metric**: All core abstractions import successfully, MongoDB running
+
+**PHASE 1: MongoDB Storage Layer** ✅
+- **Clarity**: Excellent - Models, connection manager, repositories clearly defined
+- **Feasibility**: High - Standard repository pattern, async MongoDB operations
+- **Deliverables**: Testable - Can create/read documents from all three collections
+- **Success Metric**: Save and retrieve LLMCall, ToolExecution, and Session documents
+
+**PHASE 2: LLM Service Layer** ✅
+- **Clarity**: Excellent - Provider pattern clearly shown with base class and implementations
+- **Feasibility**: High - Using official SDKs (OpenAI, Gemini), well-documented APIs
+- **Deliverables**: Testable - Can generate responses from multiple providers
+- **Success Metric**: Generate response from each provider (OpenAI, Gemini, LM Studio)
+
+**PHASE 3: Agent Layer Base Class** ✅ (IMPROVED)
+- **Clarity**: Excellent - Models, PromptBuilder, and Agent class fully specified
+- **Feasibility**: High - No external dependencies, pure Python logic
+- **Deliverables**: Testable - Can load config, build prompts, manage history
+- **Success Metric**: Agent loads YAML config, builds system prompt, manages conversation history with windowing
+
+**PHASE 4: MCP Integration** ✅ (FULLY SPECIFIED)
+- **Clarity**: Excellent - Complete implementation using official MCP Python SDK
+- **Feasibility**: High - Uses official SDK which handles protocol details
+- **Deliverables**: Testable - Manual test script validates tool discovery and execution
+- **Success Metric**: Connect to 3+ MCP servers, list 15+ tools, execute read_file successfully
+- **Protocol Details**: JSON-RPC 2.0 over stdio, complete message formats documented
+- **SDK**: Official `mcp` Python SDK from modelcontextprotocol.io
+
+**PHASE 5: Agent Intelligence & Orchestrator** ✅ (SPLIT COMPLETE)
+- **Clarity**: Complex - Combines routing agent, orchestrator, main script, self-healing
+- **Feasibility**: Medium-High - Large phase with many moving parts
+- **Deliverables**: Testable - End-to-end flow from query to tool execution
+- **Success Metric**: Agent analyzes query, calls tools via orchestrator, returns result
+- **Update (2026-02-03)**: Split complete
+  - Phase 5A: ✅ Complete
+  - Phase 5B: ✅ Complete (router runtime wiring + manual test coverage)
+
+**PHASE 6: MCP Tools (Integration)** ⚠️
+- **Clarity**: Good - Integration tasks and manual tests defined
+- **Feasibility**: High - Uses existing MCP servers
+- **Deliverables**: Testable - Servers integrated and validated
+- **Success Metric**: Manual MCP tests pass
+
+**PHASE 7: Simple Interactive UI** ✅
+- **Clarity**: Excellent - Complete Gradio implementation shown
+- **Feasibility**: High - Gradio is easy to use, well-documented
+- **Deliverables**: Testable - UI launches, shows streaming/non-streaming toggle
+- **Success Metric**: UI shows agent thoughts, tool calls, results in real-time
+
+**PHASE 8: Custom MCP Tools** ⚠️ (NEEDS MORE DETAIL)
+- **Clarity**: Medium - Goal stated but specific tools not defined
+- **Feasibility**: High - Creating MCP tools is straightforward
+- **Deliverables**: Vague - "2-3 custom tools" but which ones?
+- **Success Metric**: Custom tools callable via agent
+
+**PHASE 9: MCP Agents** ✅
+- **Clarity**: Good - Explains agents reuse Agent base class, have conversations
+- **Feasibility**: High - Reuses existing Agent class with different configs
+- **Deliverables**: Testable - 2 MCP agents (summarizer, researcher) working
+- **Success Metric**: Main agent routes to MCP agents, multi-turn conversations work
+
+**PHASE 10: A2A Protocol** ✅ (FULLY SPECIFIED)
+- **Clarity**: Excellent - Complete implementation using official A2A Python SDK
+- **Feasibility**: High - Uses official SDK with JSON-RPC 2.0 over HTTP(S)
+- **Deliverables**: Testable - Agent Card discovery, SendMessage, example server
+- **Success Metric**: Discover agent via Agent Card, send message, receive task response
+- **Protocol Details**: JSON-RPC 2.0 over HTTP(S), Agent Cards, SSE streaming documented
+- **SDK**: Official `a2a-sdk` Python SDK from a2a-protocol.org
+
+**PHASE 11: Multi-Provider Testing** ⚠️ (VAGUE TASKS)
+- **Clarity**: Medium - States "test with all providers" but not how
+- **Feasibility**: High - Manual testing is straightforward
+- **Deliverables**: Vague - "works with all providers" but no test criteria
+- **Success Metric**: All providers return responses
+- **Recommendation**: Add specific test scenarios (e.g., "query 'read test.txt' with each provider")
+
+**PHASE 12: Documentation** ⚠️ (NEEDS STRUCTURE)
+- **Clarity**: Medium - Lists what docs to create but not structure
+- **Feasibility**: High - Documentation writing is straightforward
+- **Deliverables**: Vague - "complete documentation" but no template
+- **Success Metric**: Documentation exists and examples run
+- **Recommendation**: Add documentation outline (README sections, API doc structure)
+
+### Overall Assessment
+
+**Strengths**:
+- Core phases (0-4) are extremely well defined with clear code examples
+- Provider pattern, repository pattern, dependency injection properly designed
+- Verification steps are mostly actionable and testable
+- Architecture principles are sound and well-documented
+
+**Areas for Improvement**:
+1. **Phase 5** is too large - split into Orchestrator + Routing Agent
+2. **Phase 8** needs specific tool definitions
+3. **Phase 11** needs structured test scenarios
+4. **Phase 12** needs documentation templates
+
+**Recommendations**:
+1. Split Phase 5 into 5A (Orchestrator) and 5B (Routing Agent)
+2. Define exactly which custom MCP tools to build in Phase 8 (suggested: code_analyzer, data_transformer, text_summarizer)
+3. Create test matrix for Phase 11 (provider × query × expected result)
+4. Add README template and API doc structure to Phase 12
+
+**COMPLETED IMPROVEMENTS** ✅:
+- Phase 4 (MCP): Now uses official MCP Python SDK with complete protocol details
+- A2A: Now uses official A2A Python SDK with complete protocol specification
+- Dependencies: Added `mcp` and `a2a-sdk` to Phase 0
+
+**Overall Feasibility**: ✅ **HIGH** - Plan is well-structured and achievable with minor improvements
+
+## Plan Status
+
+- **Phase 0 (Setup):** ✅ Complete
+- **Phase 1 (Storage):** ✅ Complete
+- **Phase 2 (LLM Service):** ✅ Complete
+- **Phase 3 (Agent Base):** ✅ Complete
+- **Phase 4 (MCP Integration):** ✅ Complete
+- **Phase 5A (Orchestrator):** ✅ Complete
+- **Phase 5B (Routing Agent):** ✅ Complete
+- **Phase 6 (MCP Tools Integration):** ⚠️ In Progress (existing MCP servers)
+- **Phase 7 (External UI Adapter):** Complete
+- **Phase 8 (Custom MCP Tools):** Waiting
+- **Phase 9 (MCP Agents):** Waiting
+- **Phase 10 (A2A):** Waiting
+- **Phase 11 (Testing):** Waiting
+- **Phase 12 (Docs):** Waiting
+

@@ -37,8 +37,8 @@ poetry.lock
 *~
 
 # Claude and Cursor files
-.claude/
-.cursor/
+#.claude/
+#.cursor/
 
 # Environment variables
 .env
@@ -73,3 +73,7 @@ dmypy.json
 *.tmp
 *.bak
 *.swp
+
+# Personal IDE / agent settings
+.claude/
+.cursor/refs/

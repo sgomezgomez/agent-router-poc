@@ -21,6 +21,8 @@ class LLMCall(BaseModel):
     prompt: List[JsonObject] | None = None  # Full message payload
     provider: str
     model: str
+    request_tools: List[JsonObject] | None = None
+    request_tool_choice: str | JsonObject | None = None
 
     # Sampling parameters used
     temperature: float | None = None
@@ -28,6 +30,8 @@ class LLMCall(BaseModel):
     top_k: int | None = None
     max_tokens: int | None = None
     thinking_budget: int | None = None
+    thinking_effort: str | None = None
+    enable_thinking: bool | None = None
 
     # Response
     response: str | None = None

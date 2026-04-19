@@ -1,0 +1,781 @@
+---
+description: Agent Router POC - Architecture & Design Decisions
+alwaysApply: false
+---
+
+# Agent Router POC - Architecture Document
+
+**Version**: 1.2
+**Last Updated**: 2026-02-07
+**Status**: Active Development - API adapter active, external UI clients preferred
+
+## Table of Contents
+1. [Overview](#overview)
+2. [Core Principles](#core-principles)
+3. [System Architecture](#system-architecture)
+4. [Component Responsibilities](#component-responsibilities)
+5. [Data Flow](#data-flow)
+6. [Technology Stack](#technology-stack)
+7. [Key Design Decisions](#key-design-decisions)
+8. [Storage Strategy](#storage-strategy)
+9. [Protocol Integration](#protocol-integration)
+10. [Extension Points](#extension-points)
+
+---
+
+## Overview
+
+### Purpose
+Build a proof-of-concept autonomous agent that routes user queries to appropriate tools and agents using LLM-based decision-making.
+
+### Key Design Philosophy
+**ONE smart component (Agent Layer), everything else is dumb infrastructure.**
+
+```
+User -> External UI/Client -> API Adapter -> Agent Layer (SMART) -> Infrastructure (dumb)
+                                         ↓
+                              ┌──────────┼──────────┐
+                              ↓          ↓          ↓
+                          LLM Service  Storage  Orchestrator
+                                                    ↓
+                                              MCP/A2A Tools
+```
+
+### What Makes This Architecture Special
+1. **Agent Layer has ALL intelligence** - Main script, orchestrator, connectors are pure infrastructure
+2. **Reusable Agent Layer** - Same component builds main agent, MCP agents, A2A agents
+3. **Clean separation** - LLM calls vs tool executions logged separately
+4. **Dual mode support** - Streaming and non-streaming throughout the stack
+5. **Protocol agnostic** - MCP and A2A treated uniformly through interfaces
+
+---
+
+## Core Principles
+
+### 1. Single Responsibility Principle
+Each component does ONE thing:
+- **Main Script**: I/O glue (receives input, yields output)
+- **Agent Layer**: Intelligence (analyzes, decides, coordinates, synthesizes)
+- **Catalog Layer**: Concrete worker definitions (router, tool formatter, future compacters)
+- **LLM Service**: LLM access (generates responses from multiple providers)
+- **Orchestrator**: Execution (connects to tools, executes, returns results)
+- **Storage**: Persistence (saves LLM calls and tool executions)
+- **Connectors**: Protocol communication (MCP, A2A)
+
+### 1.1 Tool & Agent Contracts
+Tools and agents define their **input arguments** and **output shapes**. The Agent Layer reads those contracts to decide what to call and how to interpret results. The Agent does **not** invent output shapes.
+
+### 2. Interface-Driven Design
+All major components implement abstract interfaces:
+```python
+# All LLM providers implement this
+class LLMProvider(ABC):
+    async def generate(self, request: LLMRequest) -> LLMResponse: ...
+    async def generate_stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]: ...
+
+# All tool connectors implement this
+class ToolConnector(ABC):
+    async def connect(self, config: Dict) -> None: ...
+    async def execute(self, tool_name: str, parameters: Dict) -> Dict: ...
+    async def list_tools(self) -> list: ...
+
+# All repositories implement this
+class Repository(ABC):
+    async def create(self, data: Dict) -> str: ...
+    async def find_by_id(self, id: str) -> Dict | None: ...
+```
+
+### 3. Dependency Injection
+Components receive dependencies via constructor:
+```python
+# Good - testable and flexible
+agent = Agent(
+    llm_service=llm_service,
+    orchestrator=orchestrator,
+    llm_call_repo=llm_call_repo,
+    conversation_repo=conversation_repo
+)
+
+# Bad - hard-coded dependencies
+agent = Agent()  # Creates its own dependencies internally
+```
+
+### 4. Separation of Data
+Two completely separate data streams:
+```
+Agent Layer → stores → llm_calls collection
+    ↓
+Orchestrator → stores → tool_executions collection
+```
+
+### 5. Event-Driven Streaming
+Streaming uses typed Pydantic models. The current agent streams `LLMStreamChunk`
+events that carry output text, optional reasoning, and tool call deltas:
+```python
+LLMStreamChunk(content="Here's the file content...")
+LLMStreamChunk(reasoning="Thinking...", is_reasoning=True)
+LLMStreamChunk(tool_calls=[{"type": "function", "function": {...}}])
+```
+
+---
+
+## System Architecture
+
+### High-Level Flow
+```
+1. User sends query via CLI/UI
+2. Main Script receives input (zero logic)
+3. Main Script passes to Agent Layer
+4. Agent Layer:
+   a. Uses LLM Service to analyze query and decide routing
+   b. Stores LLM call to MongoDB
+   c. Calls Orchestrator with routing decision
+   d. Orchestrator executes tools (stores executions to MongoDB)
+   e. Agent synthesizes final response using LLM
+   f. Stores synthesis LLM call to MongoDB
+5. Main Script yields response to user
+```
+
+### Component Diagram
+```
+┌─────────────────────────────────────────────────────────┐
+│                    MAIN SCRIPT                          │
+│              (Dumb Entry Point)                         │
+│  - Receives user input                                  │
+│  - Passes to Agent Layer                                │
+│  - Yields whatever Agent returns                        │
+│  - ZERO logic, ZERO decisions                           │
+└────────────────────┬────────────────────────────────────┘
+                     │
+                     ▼
+┌─────────────────────────────────────────────────────────┐
+│                  AGENT LAYER                            │
+│              (THE SMART COMPONENT)                      │
+│  ALL intelligence and coordination                      │
+│                                                         │
+│  ┌─────────────┬──────────────┬─────────────┐           │
+│  ▼             ▼              ▼             ▼           │
+│ LLM         Storage      Orchestrator    Conversation   │
+│ Service     (logs LLM)   (executes)      Management     │
+│                                                         │
+│  Makes ALL decisions:                                   │
+│  - Which tools to call                                  │
+│  - What parameters to use                               │
+│  - Sequential vs parallel                               │
+│  - Retry vs abort on errors                             │
+│  - How to synthesize response                           │
+└────────────────────┬────────────────────────────────────┘
+                     │
+          ┌──────────┼──────────┐
+          ▼          ▼          ▼
+     ┌────────┐ ┌────────┐ ┌────────┐
+     │  MCP   │ │  MCP   │ │  A2A   │
+     │ Tools  │ │ Agents │ │ Agents │
+     └────────┘ └────────┘ └────────┘
+          │          │          │
+          └──────────┴──────────┘
+                     │
+                     ▼
+            ┌─────────────────┐
+            │    MongoDB      │
+            │  - llm_calls    │
+            │  - tool_execs   │
+            │  - conversations│
+            └─────────────────┘
+```
+
+---
+
+## Component Responsibilities
+
+### Main Script (`main.py`)
+**Role**: Dumb I/O glue
+**Responsibilities**:
+- Accept user input from CLI/UI
+- Create Agent Layer instance with dependencies
+- Pass query to Agent Layer
+- Yield/return whatever Agent Layer produces
+- **NOT ALLOWED TO**: Make decisions, coordinate, analyze, plan
+
+**Example**:
+```python
+async def main(query: str, stream: bool = False):
+    # Create dependencies
+    settings = Settings()
+    llm_service = LLMService(settings)
+    orchestrator = Orchestrator(...)
+    agent = Agent(llm_service=llm_service, orchestrator=orchestrator, ...)
+
+    # Pass to agent and yield results
+    if stream:
+        async for event in agent.process_query(query, stream=True):
+            print(event)
+    else:
+        response = await agent.process_query(query, stream=False)
+        print(response)
+```
+
+### Agent Layer (`agent/`)
+**Role**: THE smart orchestrator
+**Responsibilities**:
+- Analyze user queries using LLM
+- Decide which tools/agents to call
+- Determine parameters for each tool
+- Decide execution order (sequential/parallel)
+- Store LLM calls and conversation updates as soon as responses are available
+- Call Orchestrator for tool execution
+- Analyze functional failures and decide next steps (retry same tool/agent, try another tool/agent, ask user, abort)
+- Synthesize final responses
+- Manage conversation history and context
+- Support both streaming and non-streaming modes
+- **REUSABLE**: Same component can build MCP agents, A2A agents, etc.
+
+**Key Methods**:
+```python
+class Agent:
+    async def process_query(self, query: str, stream: bool = False):
+        """Main entry point - handles both streaming and non-streaming."""
+
+    async def _analyze_and_route(self, query: str):
+        """Use LLM to decide which tools to call."""
+
+    async def _execute_with_retry(self, routing_decision):
+        """Execute via orchestrator with self-healing."""
+
+    async def _synthesize_response(self, query, results):
+        """Create final response using LLM."""
+```
+
+### LLM Service (`llm/`)
+**Role**: Multi-provider LLM access
+**Responsibilities**:
+- Provide unified interface to multiple LLM providers
+- Handle provider-specific API calls
+- Support streaming and non-streaming
+- Technical resilience only (automatic retries on transient failures)
+- Surface parse errors and raw responses for Agent-level recovery
+- **NOT ALLOWED TO**: Store data (Agent does this)
+
+**Provider Pattern**:
+```python
+class BaseLLMProvider(LLMProvider):
+    async def generate(self, request: LLMRequest) -> LLMResponse: ...
+    async def generate_stream(self, request: LLMRequest) -> AsyncIterator[LLMStreamChunk]: ...
+
+class OpenAICompatibleProvider(BaseLLMProvider): ...
+class GeminiProvider(BaseLLMProvider): ...
+class LMStudioProvider(OpenAICompatibleProvider): ...
+class GrokProvider(OpenAICompatibleProvider): ...
+```
+
+**Model Registry (`config/llm_models.yaml`)**:
+- Centralized per-model capabilities and costs
+- Drives API mode selection (chat vs responses)
+- Defines tool schema for responses vs chat completions
+- Allows provider-specific toggles (e.g., `enableThinking` for LM Studio via `extra_body`)
+- Supports optional overrides for tool calls (`tools_api_mode`) when a model requires a specific API mode for tools
+
+### Orchestrator (`orchestrator/`)
+**Role**: Dumb execution engine
+**Responsibilities**:
+- Take routing decisions from Agent
+- Execute tool/agent calls (MCP and A2A)
+- Store tool execution logs to MongoDB
+- Collect and return results
+- **NOT ALLOWED TO**: Make decisions, analyze errors, retry logic
+
+**Example**:
+```python
+class Orchestrator:
+    async def execute(self, routing_decision: RoutingDecision):
+        """Execute tools based on Agent's decision."""
+        results = []
+        for tool_call in routing_decision.tools:
+            result = await self._execute_tool(tool_call)
+            await self._store_execution(tool_call, result)  # Log to MongoDB
+            results.append(result)
+        return results
+```
+
+### Storage Layer (`storage/`)
+**Role**: MongoDB persistence
+**Responsibilities**:
+- Provide repository pattern for data access
+- Two separate collections:
+  - `llm_calls` - Stored BY Agent Layer
+  - `tool_executions` - Stored BY Orchestrator
+- Conversation management for history (`conversations`)
+- Provide storage builders for consistent record creation
+
+**Data Separation**:
+```python
+# Agent Layer stores LLM calls
+llm_call_repo.save_llm_call({
+    "system_prompt": "...",
+    "user_prompt": "...",
+    "response": "...",
+    "provider": "openai",
+    "streaming": False
+})
+
+# Orchestrator stores tool executions
+tool_exec_repo.save_execution({
+    "tool_name": "read_file",
+    "tool_type": "mcp_tool",
+    "parameters": {...},
+    "result": {...}
+})
+```
+
+### Connectors (`connectors/`)
+**Role**: Protocol-specific communication
+**Responsibilities**:
+- Implement ToolConnector interface for MCP and A2A
+- Handle protocol-specific message formats
+- Manage connections to external services
+- Use official SDKs where available
+
+**MCP Connector**:
+```python
+class MCPClient(ToolConnector):
+    """Uses official MCP Python SDK."""
+    async def connect(self, config: Dict): ...
+    async def execute(self, tool_name: str, parameters: Dict): ...
+    async def list_tools(self): ...
+```
+
+**A2A Connector**:
+```python
+class A2AClient(ToolConnector):
+    """Uses official A2A Python SDK."""
+    async def connect(self, config: Dict): ...
+    async def execute(self, tool_name: str, parameters: Dict): ...
+    async def list_tools(self): ...
+```
+
+---
+
+## Data Flow
+
+### Non-Streaming Mode
+```
+1. User → Main Script: "Read test.txt"
+2. Main Script → Agent: process_query("Read test.txt", stream=False)
+3. If tools are configured: Agent loads MCP tool contracts (filtered by allowlists)
+4. Agent → LLM Service: generate() with tools available (or none)
+5. LLM Service → Agent: LLMResponse (tool_calls or final content)
+6. Agent → Storage: Save LLM call
+7. If tool_calls:
+   a. Agent → Orchestrator: execute_tool_calls()
+   b. Orchestrator → MCP Client: tools/call
+   c. Orchestrator → Storage: Save tool execution
+   d. Agent → Storage: Persist tool messages
+   e. Agent loops back to step 3 with tool results appended
+8. If no tool_calls: Agent returns final response
+```
+
+### Streaming Mode
+```
+Same tool loop, but:
+- Agent streams LLM chunks (LLMStreamChunk) as they arrive
+- Tool calls are accumulated from chunk deltas
+- Agent executes tools, appends tool results, and continues looping
+- When no tool_calls remain, the streamed content is the final answer
+```
+
+---
+
+## Technology Stack
+
+### Core Technologies
+| Component | Technology | Version | Purpose |
+|-----------|-----------|---------|---------|
+| Language | Python | 3.10+ | Primary development language |
+| Package Manager | Poetry | Latest | Dependency management |
+| Database | MongoDB (local community server) | 7.0 | Data persistence |
+| Async Runtime | asyncio | Built-in | Async/await support |
+
+### LLM Providers
+| Provider | SDK | Purpose |
+|----------|-----|---------|
+| OpenAI | `openai` | GPT-4, GPT-3.5 |
+| Google Gemini | `google-genai` | Gemini Pro |
+| LM Studio | `openai` (compatible) | Local models |
+| Grok | `openai` (compatible) | Grok models |
+
+### Protocol Support
+| Protocol | SDK | Purpose |
+|----------|-----|---------|
+| MCP | `mcp` | Model Context Protocol - official SDK |
+| A2A | `a2a-sdk` | Agent-to-Agent - official SDK |
+
+### Infrastructure
+| Component | Library | Purpose |
+|-----------|---------|---------|
+| MongoDB Driver | `motor` | Async MongoDB |
+| Config Management | `pydantic-settings` | Type-safe configuration |
+| Data Validation | `pydantic` | Data models |
+| HTTP Client | `httpx` | Async HTTP requests |
+| Retry Logic | `tenacity` | Exponential backoff |
+| API Adapter | `fastapi` + `uvicorn` | OpenAI-compatible API for external clients |
+
+---
+
+## Key Design Decisions
+
+### Decision 1: Agent Layer Does EVERYTHING
+**Rationale**: Centralize all intelligence in one place
+**Impact**: Makes the system easier to understand and debug
+**Trade-off**: Agent Layer is more complex, but everything else is simple
+
+### Decision 2: Separate LLM Calls from Tool Executions
+**Rationale**: Different lifecycles, different analysis needs
+**Impact**: Two collections in MongoDB
+**Benefit**: Can analyze LLM costs separately from tool usage
+
+### Decision 3: Use Official SDKs for MCP and A2A
+**Rationale**: Protocol complexity handled by experts
+**Impact**: Less custom protocol code to maintain
+**Benefit**: Automatic updates when protocols evolve
+
+### Decision 4: Streaming AND Non-Streaming Support
+**Rationale**: Different UX needs (debugging vs production)
+**Impact**: All components must support both modes
+**Benefit**: Flexibility for different use cases
+
+### Decision 5: Repository Pattern for Storage
+**Rationale**: Clean data access layer
+**Impact**: Storage can be swapped (MongoDB → PostgreSQL)
+**Benefit**: Testability and flexibility
+
+### Decision 6: Provider Pattern for LLMs
+**Rationale**: Multiple LLM providers with fallback
+**Impact**: Each provider has its own class
+**Benefit**: Easy to add new providers
+
+### Decision 7: Reusable Agent Layer
+**Rationale**: MCP agents and A2A agents need same capabilities
+**Impact**: Agent Layer is a library component
+**Benefit**: Consistency across all agent types
+
+### Decision 8: YAML-Based Configuration
+**Rationale**: Persona management without code changes
+**Impact**: Agent configs are external files
+**Benefit**: Non-developers can create agents
+
+### Decision 9: MongoDB for POC (Local by Default)
+**Rationale**: Schema flexibility during development with minimal setup overhead
+**Why MongoDB**:
+- Flexible schema (can evolve models without migrations)
+- Good for logging/audit trails
+- Native JSON support
+- Local-first development (no Docker requirement)
+- Document-based matches our data model
+**Alternative**: PostgreSQL with JSONB (considered for production)
+
+### Decision 10: OpenAI-Compatible API Adapter
+**Rationale**: Reuse mature external UIs without custom frontend maintenance
+**Impact**: External clients call `/v1/models` and `/v1/chat/completions`
+**Benefit**: Faster testing with less UI code churn
+**Current**: Implemented in `src/agent_router/api/openai_adapter.py`
+
+### Decision 11: Catalog Layer for Worker Agents
+**Rationale**: Keep concrete worker definitions in one place
+**Impact**: Router and helper workers (formatter, future compacter) are catalog entries
+**Benefit**: Clear ownership boundary between orchestration engine and worker implementations
+
+### Decision 12: Multi-Tier Fallback Strategy
+**Rationale**: Maximize reliability while keeping the Agent focused on functional logic
+**Impact**: LLM Service handles technical retries; Agent decides next steps on functional failure
+**Strategy**:
+1. **Primary attempt**: LLM Service uses agent parameters, falling back when omitted
+2. **Technical retry**: Automatic retry per configured policy (including parse failures)
+3. **Surface failure**: Raise typed error to Agent for functional recovery (retry tool/agent, alternate tool/agent, ask user, abort)
+
+**Configuration Layers**:
+```
+Agent Call → Primary Config (provider, model, temp, top_p, top_k, thinking_budget)
+    ↓ (fails after 3 retries)
+Fallback Config → Reliable provider (lm_studio), conservative params (temp=0.5)
+    ↓ (1 final attempt)
+Error → Let Agent decide (retry with different approach, abort, etc.)
+```
+
+**Example**:
+```python
+# Service uses agent parameters, falling back when omitted
+llm_response = await llm_service.generate(prompt=prompt)
+```
+
+**Benefit**:
+- Agent stays focused on functional logic
+- LLM Service handles transient technical failures
+- Agent decides next step only when needed
+
+---
+
+## Storage Strategy
+
+### Collections
+
+#### `llm_calls` - Stored BY Agent Layer
+```python
+{
+    "uuid": "550e8400-e29b-41d4-a716-446655440000",
+    "conversation_id": "conversation-123",
+    "prompt": [
+        {"role": "system", "content": "You are a routing agent..."},
+        {"role": "user", "content": "Read test.txt"}
+    ],
+    "response": "Tool call or final response text",
+    "provider": "openai",
+    "model": "gpt-4o-mini",
+    "usage": {"prompt_tokens": 150, "completion_tokens": 50},
+    "latency_ms": 1234.5,
+    "streaming": false,
+    "timestamp": "2026-01-12T10:30:00Z",
+    "error": null
+}
+```
+
+#### `tool_executions` - Stored BY Orchestrator
+```python
+{
+    "uuid": "550e8400-e29b-41d4-a716-446655440001",
+    "conversation_id": "conversation-123",
+    "tool_name": "read_file",
+    "tool_type": "mcp_tool",  # or "mcp_agent" or "a2a_agent"
+    "parameters": {"path": "test.txt"},
+    "result": {"content": "file contents..."},
+    "error": null,
+    "latency_ms": 45.2,
+    "timestamp": "2026-01-12T10:30:01Z"
+}
+```
+
+#### `conversations` - Conversation History
+```python
+{
+    "uuid": "conversation-123",
+    "message_history": [
+        {"role": "user", "content": "Read test.txt", "timestamp": "..."},
+        {"role": "assistant", "content": "", "tool_calls": [...], "timestamp": "..."},
+        {"role": "tool", "content": "{...tool result...}", "tool_call_id": "toolcall-1"},
+        {"role": "assistant", "content": "Here's the content...", "reasoning": "..."}
+    ],
+    "created_at": "2026-01-12T10:00:00Z",
+    "last_updated": "2026-01-12T10:30:01Z"
+}
+```
+
+### Indexing Strategy
+```python
+# llm_calls collection
+db.llm_calls.createIndex({"conversation_id": 1, "timestamp": -1})
+db.llm_calls.createIndex({"provider": 1, "timestamp": -1})
+db.llm_calls.createIndex({"streaming": 1})
+
+# tool_executions collection
+db.tool_executions.createIndex({"conversation_id": 1, "timestamp": -1})
+db.tool_executions.createIndex({"tool_name": 1, "timestamp": -1})
+db.tool_executions.createIndex({"tool_type": 1})
+
+# conversations collection
+db.conversations.createIndex({"last_updated": -1})
+```
+
+### MongoDB Configuration Best Practices (Local)
+
+**Environment Configuration** (Pydantic nested settings):
+```bash
+MONGODB__URI=mongodb://localhost:27017/?retryWrites=false
+MONGODB__DATABASE=agent_router_db
+MONGODB__USERNAME=your_username
+MONGODB__PASSWORD=your_password
+```
+
+**Critical Configuration Requirements**:
+
+1. **Disable Retryable Writes for Standalone Instances**
+   - Standalone MongoDB (not replica sets) must use `retryWrites=false`
+   - Without this, authentication errors can occur even with correct credentials
+   - Add `?retryWrites=false` to the connection string
+
+2. **authSource Must Match User Database**
+   - The `authSource` parameter must be the database where the user was created
+   - For this project: `authSource=agent_router_db` (NOT `authSource=admin`)
+   - Code automatically sets `authSource` to match `MONGODB__DATABASE`
+
+3. **URL Encode Credentials**
+   - Always URL-encode credentials with special characters
+   - Use `urllib.parse.quote_plus()` for both username and password
+   - Example: `Q4v!nT8@zK2#` → `Q4v%21nT8%40zK2%23`
+
+4. **Connection String Format**
+   ```python
+   # With authentication
+   mongodb://username:password@localhost:27017/database?authSource=database&retryWrites=false
+
+   # Without authentication (development only)
+   mongodb://localhost:27017/?retryWrites=false
+   ```
+
+5. **Setup Process**
+   - Create database in MongoDB Compass first
+   - Create user in that database (not in admin database)
+   - Use the database name as authSource
+   - Configure credentials in `.env`
+
+**Known Issues**:
+- Error "Command insert requires authentication" often indicates incorrect `authSource` or `retryWrites` configuration
+- If Docker is used for experiments, ensure replica set config or disable retryable writes; local MongoDB is the supported dev path
+
+**Connection Manager Implementation**:
+```python
+from urllib.parse import quote_plus
+from motor.motor_asyncio import AsyncIOMotorClient
+
+# Build authenticated connection string
+username = quote_plus(config.username)
+password = quote_plus(config.password)
+protocol, rest = config.uri.split("://", 1)
+
+# Use target database as authSource (where user was created)
+auth_uri = f"{protocol}://{username}:{password}@{rest.split('?')[0]}?authSource={config.database}&retryWrites=false"
+client = AsyncIOMotorClient(auth_uri, maxPoolSize=10, minPoolSize=1)
+
+# Test connection
+await client.admin.command('ping')
+```
+
+---
+
+## Protocol Integration
+
+### MCP (Model Context Protocol)
+**Purpose**: Connect to local/remote tools and services
+**Transport**: JSON-RPC 2.0 over stdio (local) or HTTP (remote)
+**Official SDK**: `mcp` Python package
+**Reference**: https://modelcontextprotocol.io
+
+**Retry Configuration**:
+Per-server retry settings are defined in `config/mcp_servers.yaml`:
+`retry_max_retries`, `retry_base_delay`, `retry_max_delay`, `retry_exponential_base`.
+
+**Key Methods**:
+- `initialize` - Establish connection
+- `tools/list` - Discover available tools
+- `tools/call` - Execute a tool
+- `resources/list` - List available resources
+- `resources/read` - Read a resource
+
+**Example Tools**:
+- Filesystem operations (read, write, list)
+- Web operations (search, fetch)
+- Database operations (query)
+
+### A2A (Agent-to-Agent Protocol)
+**Purpose**: Enable communication between independent AI agent systems
+**Transport**: JSON-RPC 2.0 over HTTP(S)
+**Official SDK**: `a2a-sdk` Python package
+**Reference**: https://a2a-protocol.org
+
+**Discovery**: Agent Cards at `/.well-known/agent-card.json`
+
+**Key Methods**:
+- `SendMessage` - Send message to agent
+- `GetTask` - Fetch task state
+- `ListTasks` - Query tasks with filters
+- `CancelTask` - Stop execution
+- Streaming via Server-Sent Events (SSE)
+- Async via webhooks
+
+**Task Lifecycle**:
+```
+submitted → working → completed/failed/cancelled
+                   → input-required (for multi-turn)
+```
+
+---
+
+## Extension Points
+
+### Adding New LLM Providers
+1. Create provider class extending `BaseLLMProvider`
+2. Implement `_call_api()` and `_call_api_stream()`
+3. Add to `LLMService._load_providers()`
+4. Add configuration to `.env` and `config/llm_providers.yaml`
+
+### Adding New Tool Connectors
+1. Create client class implementing `ToolConnector` interface
+2. Implement `connect()`, `execute()`, `list_tools()`
+3. Add to tool registry initialization
+4. Add configuration to `config/mcp_servers.yaml`
+
+### Creating New Agents
+1. Create YAML config in `config/agents/`
+2. Define background, goal, task, guidelines, examples, guardrails
+3. Load via `AgentConfig.from_yaml()`
+4. Pass to `Agent(config)` constructor
+5. Agent automatically gets all capabilities (LLM, tools, storage)
+
+### Adding New Storage Backends
+1. Create repository class implementing `Repository` interface
+2. Implement `create()`, `find_by_id()`, `find_many()`, `update()`
+3. Swap in dependency injection when creating Agent
+
+### Changing External UI Client
+1. Run backend adapter: `python -m agent_router.api.openai_adapter`
+2. Point client to `http://127.0.0.1:8000/v1`
+3. Use model ids from `/v1/models` (recommended: `provider:model`)
+4. Keep tool orchestration in backend
+
+---
+
+## Future Considerations
+
+### Production Readiness
+- [ ] Implement authentication/authorization
+- [ ] Add rate limiting
+- [ ] Production MongoDB configuration
+- [ ] Monitoring and observability
+- [ ] Error tracking (Sentry)
+- [ ] Performance profiling
+
+### Scalability
+- [ ] Horizontal scaling of Agent instances
+- [ ] Queue-based tool execution
+- [ ] Caching layer for tool results
+- [ ] Connection pooling optimizations
+
+### Advanced Features
+- [ ] Multi-agent collaboration
+- [ ] Long-running task support
+- [ ] Conversation branching
+- [ ] Tool usage analytics
+- [ ] Cost optimization strategies
+- [ ] A/B testing for routing decisions
+
+---
+
+## References
+
+**External Documentation**:
+- MCP Specification: https://modelcontextprotocol.io/specification/2025-11-25
+- A2A Specification: https://a2a-protocol.org/latest/specification/
+- Python AsyncIO: https://docs.python.org/3/library/asyncio.html
+- Pydantic: https://docs.pydantic.dev/
+- Motor: https://motor.readthedocs.io/
+
+**Internal Documents**:
+- Implementation Plan: `.cursor/rules/agent-router-plan.mdc`
+- Project README: `README.md` (to be created)
+
+---
+
+**Document Maintenance**:
+- Update this document when architecture changes
+- Keep it synchronized with implementation
+- Reference from implementation plan
+- Use as onboarding guide for new developers
+

@@ -32,6 +32,25 @@ class AgentConfig(BaseModel):
     max_tokens: int | None = None
     thinking_budget: int | None = None
     thinking_effort: str | None = None
+    enable_thinking: bool | None = None
+    max_tool_iterations: int
+    stream_tool_planning: bool
+    allowed_mcp_servers: list[str] | None = Field(
+        default=None,
+        description="Allowed MCP servers for this agent (optional allowlist).",
+    )
+    allowed_mcp_tools: list[str] | None = Field(
+        default=None,
+        description="Allowed MCP tools (server::tool) for this agent.",
+    )
+    allowed_mcp_agents: list[str] | None = Field(
+        default=None,
+        description="Allowed MCP agents (server::agent) for this agent.",
+    )
+    allowed_a2a_agents: list[str] | None = Field(
+        default=None,
+        description="Allowed A2A agents (agent::skill) for this agent.",
+    )
 
     @classmethod
     def from_yaml(cls, path: Path, agent_name: str) -> "AgentConfig":

@@ -4,6 +4,7 @@ import json
 import logging
 import asyncio
 from typing import AsyncIterator
+from uuid import uuid4
 from agent_router.core.config import Settings
 from agent_router.core.errors import LLMProviderError
 from agent_router.llm.models import LLMRequest, LLMResponse, LLMStreamChunk, Message
@@ -50,8 +51,16 @@ class LLMService:
         self.fallback_top_k = settings.fallback_top_k
         self.fallback_thinking_budget = settings.fallback_thinking_budget
         self.fallback_thinking_effort = settings.fallback_thinking_effort
+        self.fallback_enable_thinking = settings.fallback_enable_thinking
 
         logger.info("LLMService initialized with lazy provider loading")
+
+    def _is_debug_logging_enabled(self) -> bool:
+        return bool(self.settings.llm_debug_logging)
+
+    def _log_debug(self, message: str) -> None:
+        if self._is_debug_logging_enabled():
+            logger.info(f"[LLM-DEBUG] {message}")
 
     def _get_provider(self, provider_name: str) -> BaseLLMProvider:
         """Get or create provider (lazy loading).
@@ -161,16 +170,19 @@ class LLMService:
             LLMProviderError: If no valid input provided
         """
         if messages:
-            # Clean existing messages
-            return [
-                Message(
-                    role=msg.role,
-                    content=clean_encoded_text(msg.content),
-                    tool_calls=msg.tool_calls,
-                    tool_call_id=msg.tool_call_id
-                )
-                for msg in messages
-            ]
+            # Clean existing messages and avoid sending null tool fields
+            built = []
+            for msg in messages:
+                payload = {
+                    "role": msg.role,
+                    "content": clean_encoded_text(msg.content),
+                }
+                if msg.tool_calls:
+                    payload["tool_calls"] = msg.tool_calls
+                if msg.tool_call_id:
+                    payload["tool_call_id"] = msg.tool_call_id
+                built.append(Message(**payload))
+            return built
 
         # Build from prompts
         built_messages = []
@@ -205,6 +217,7 @@ class LLMService:
         max_tokens: int | None = None,
         thinking_budget: int | None = None,
         thinking_effort: str | None = None,
+        enable_thinking: bool | None = None,
         tools: list | None = None,
         tool_choice: str | dict | None = None,
         response_format: type | None = None,
@@ -240,6 +253,8 @@ class LLMService:
         Raises:
             LLMProviderError: If all attempts fail
         """
+        request_id = uuid4().hex[:8]
+
         # Build and clean messages
         built_messages = self._build_messages(messages, system_prompt, user_prompt)
 
@@ -266,6 +281,21 @@ class LLMService:
             if thinking_effort is not None
             else self.settings.fallback_thinking_effort
         )
+        enable_thinking = (
+            enable_thinking
+            if enable_thinking is not None
+            else self.settings.fallback_enable_thinking
+        )
+
+        # Respect model capability flags (avoid unsupported thinking params)
+        capabilities = self.model_registry.get_model_capabilities(primary_provider, model)
+        if capabilities:
+            if capabilities.supports_thinking_effort is False:
+                thinking_effort = None
+            if capabilities.supports_thinking_budget is False:
+                thinking_budget = None
+            if capabilities.supports_enable_thinking is False:
+                enable_thinking = None
 
         # Build request for primary provider
         request = LLMRequest(
@@ -278,6 +308,7 @@ class LLMService:
             max_tokens=max_tokens,
             thinking_budget=thinking_budget,
             thinking_effort=thinking_effort,
+            enable_thinking=enable_thinking,
             tools=tools,
             tool_choice=tool_choice,
             response_format=response_format,
@@ -286,10 +317,15 @@ class LLMService:
 
         try:
             # Try primary provider with retries (via decorator)
-            logger.info(
-                f"Generating with {primary_provider}, model={model or 'default'}"
+            logger.info(f"Generating with {primary_provider}, model={model or 'default'}")
+            self._log_debug(
+                f"id={request_id} mode=non_stream provider={primary_provider} model={model} "
+                f"messages={len(built_messages)} tools={len(tools) if tools else 0} "
+                f"temp={temperature} top_p={top_p} top_k={top_k} max_tokens={max_tokens} "
+                f"thinking_budget={thinking_budget} thinking_effort={thinking_effort} "
+                f"enable_thinking={enable_thinking}"
             )
-            return await self._call_provider(request, primary_provider)
+            return await self._call_provider(request, primary_provider, request_id=request_id)
 
         except Exception as primary_error:
             # Check if we're already using fallback configuration
@@ -308,9 +344,14 @@ class LLMService:
             logger.warning(
                 f"Primary {primary_provider} failed, trying fallback {self.fallback_provider}"
             )
+            self._log_debug(
+                f"id={request_id} primary_failed provider={primary_provider} model={model} "
+                f"error={type(primary_error).__name__}: {primary_error}"
+            )
 
             try:
                 return await self._try_fallback_provider(
+                    request_id=request_id,
                     built_messages=built_messages,
                     tools=tools,
                     tool_choice=tool_choice,
@@ -337,6 +378,7 @@ class LLMService:
         max_tokens: int | None = None,
         thinking_budget: int | None = None,
         thinking_effort: str | None = None,
+        enable_thinking: bool | None = None,
         tools: list | None = None,
         tool_choice: str | dict | None = None
     ) -> AsyncIterator[LLMStreamChunk]:
@@ -365,6 +407,8 @@ class LLMService:
         Raises:
             LLMProviderError: If streaming fails
         """
+        request_id = uuid4().hex[:8]
+
         # Build and clean messages
         built_messages = self._build_messages(messages, system_prompt, user_prompt)
 
@@ -391,6 +435,21 @@ class LLMService:
             if thinking_effort is not None
             else self.settings.fallback_thinking_effort
         )
+        enable_thinking = (
+            enable_thinking
+            if enable_thinking is not None
+            else self.settings.fallback_enable_thinking
+        )
+
+        # Respect model capability flags (avoid unsupported thinking params)
+        capabilities = self.model_registry.get_model_capabilities(provider_name, model)
+        if capabilities:
+            if capabilities.supports_thinking_effort is False:
+                thinking_effort = None
+            if capabilities.supports_thinking_budget is False:
+                thinking_budget = None
+            if capabilities.supports_enable_thinking is False:
+                enable_thinking = None
 
         # Build request
         request = LLMRequest(
@@ -403,6 +462,7 @@ class LLMService:
             max_tokens=max_tokens,
             thinking_budget=thinking_budget,
             thinking_effort=thinking_effort,
+            enable_thinking=enable_thinking,
             tools=tools,
             tool_choice=tool_choice,
             stream=True
@@ -410,6 +470,13 @@ class LLMService:
 
         logger.info(
             f"Streaming from {provider_name}, model={model or 'default'}"
+        )
+        self._log_debug(
+            f"id={request_id} mode=stream provider={provider_name} model={model} "
+            f"messages={len(built_messages)} tools={len(tools) if tools else 0} "
+            f"temp={temperature} top_p={top_p} top_k={top_k} max_tokens={max_tokens} "
+            f"thinking_budget={thinking_budget} thinking_effort={thinking_effort} "
+            f"enable_thinking={enable_thinking}"
         )
 
         # Stream from provider with retry policy
@@ -422,11 +489,19 @@ class LLMService:
             yielded_any = False
             try:
                 provider = self._get_provider(provider_name)
+                self._log_debug(
+                    f"id={request_id} stream_attempt={attempt + 1}/{max_retries} provider={provider_name}"
+                )
                 async for chunk in provider.generate_stream(request):
                     yielded_any = True
                     yield chunk
                 return
             except Exception as e:
+                self._log_debug(
+                    f"id={request_id} stream_attempt_failed={attempt + 1}/{max_retries} "
+                    f"provider={provider_name} yielded_any={yielded_any} "
+                    f"error={type(e).__name__}: {e}"
+                )
                 if yielded_any or attempt >= max_retries - 1:
                     raise LLMProviderError(
                         f"Streaming failed after {attempt + 1} attempts: {e}"
@@ -468,7 +543,8 @@ class LLMService:
     async def _call_provider(
         self,
         request: LLMRequest,
-        provider_name: str
+        provider_name: str,
+        request_id: str | None = None,
     ) -> LLMResponse:
         """Call provider with automatic retry via decorator.
 
@@ -495,6 +571,10 @@ class LLMService:
             try:
                 # Get provider (lazy loads if not already cached)
                 provider = self._get_provider(provider_name)
+                self._log_debug(
+                    f"id={request_id or 'internal'} provider_attempt={attempt + 1}/{max_retries} "
+                    f"provider={provider_name} model={request.model}"
+                )
 
                 response = await provider.generate(request)
 
@@ -531,6 +611,11 @@ class LLMService:
                 return response
             except Exception as e:
                 last_exception = e
+                self._log_debug(
+                    f"id={request_id or 'internal'} provider_attempt_failed={attempt + 1}/{max_retries} "
+                    f"provider={provider_name} model={request.model} "
+                    f"error={type(e).__name__}: {e}"
+                )
                 if attempt >= max_retries - 1:
                     raise LLMProviderError(
                         f"Failed after {max_retries} attempts: {e}"
@@ -556,6 +641,7 @@ class LLMService:
     
     async def _try_fallback_provider(
         self,
+        request_id: str,
         built_messages: list[Message],
         tools: list | None,
         tool_choice: str | dict | None,
@@ -585,6 +671,7 @@ class LLMService:
             top_k=self.settings.fallback_top_k,
             thinking_budget=self.settings.fallback_thinking_budget,
             thinking_effort=self.settings.fallback_thinking_effort,
+            enable_thinking=self.settings.fallback_enable_thinking,
             tools=tools,
             tool_choice=tool_choice,
             response_format=response_format,
@@ -593,8 +680,13 @@ class LLMService:
 
         response = await self._call_provider(
             fallback_request,
-            self.fallback_provider
+            self.fallback_provider,
+            request_id=request_id,
         )
         response.used_fallback = True
+        self._log_debug(
+            f"id={request_id} fallback_succeeded provider={self.fallback_provider} "
+            f"model={self.fallback_model} used_fallback=True"
+        )
         logger.info(f"Fallback {self.fallback_provider} succeeded")
         return response

@@ -29,7 +29,7 @@ class ModelCapabilities(BaseModel):
     supports_response_format: bool | None = None
     supports_thinking_effort: bool | None = None
     supports_thinking_budget: bool | None = None
-    enable_thinking: bool | None = None
+    supports_enable_thinking: bool | None = None
     tool_schema: Literal["chat_completions", "responses"] | None = None
     tools_api_mode: Literal["chat_completions", "responses"] | None = None # openai-compatible only
     max_tokens_param: Literal["max_tokens", "max_completion_tokens"] | None = None

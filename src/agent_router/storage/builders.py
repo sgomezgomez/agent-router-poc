@@ -33,6 +33,8 @@ def build_llm_call(
     return LLMCall(
         conversation_id=conversation_id,
         prompt=prompt,
+        request_tools=request.tools if request else None,
+        request_tool_choice=request.tool_choice if request else None,
         provider=response.provider if response else (request.provider if request else ""),
         model=response.model if response else (request.model if request else ""),
         temperature=request.temperature if request else None,
@@ -40,6 +42,8 @@ def build_llm_call(
         top_k=request.top_k if request else None,
         max_tokens=request.max_tokens if request else (response.max_tokens if response else None),
         thinking_budget=request.thinking_budget if request else None,
+        thinking_effort=request.thinking_effort if request else None,
+        enable_thinking=request.enable_thinking if request else None,
         response=response.content if response else None,
         raw_response=response.raw_content if response else None,
         parsed_response=response.parsed_response if response else None,

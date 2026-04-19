@@ -8,6 +8,7 @@ providers:
         supports_response_format: true
         supports_thinking_effort: true
         supports_thinking_budget: false
+        supports_enable_thinking: false
         max_tokens_param: max_completion_tokens
         api_mode: responses
         costs:
@@ -23,6 +24,7 @@ providers:
         supports_response_format: true
         supports_thinking_effort: false
         supports_thinking_budget: false
+        supports_enable_thinking: false
         max_tokens_param: max_tokens
         api_mode: responses
         costs:
@@ -39,6 +41,7 @@ providers:
         supports_response_format: true
         supports_thinking_effort: true
         supports_thinking_budget: false
+        supports_enable_thinking: false
         max_tokens_param: max_tokens
         costs:
           input_per_1m_usd: 0.0
@@ -51,7 +54,7 @@ providers:
         supports_response_format: true
         supports_thinking_effort: false
         supports_thinking_budget: false
-        enable_thinking: true
+        supports_enable_thinking: true
         tool_schema: responses
         tools_api_mode: chat_completions
         max_tokens_param: max_tokens
@@ -62,8 +65,14 @@ providers:
   gemini:
     models:
       gemini-2.5-flash-lite:
+        supports_temperature: true
+        supports_top_p: true
+        supports_top_k: true
+        supports_tools: true
+        supports_response_format: true
         supports_thinking_budget: true
         supports_thinking_effort: false
+        supports_enable_thinking: false
         costs:
           input_per_1m_usd: 0.1
           output_per_1m_usd: 0.4
